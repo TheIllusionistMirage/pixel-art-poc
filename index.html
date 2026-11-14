@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Medieval Village PoC</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+      canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+      canvas:active { cursor: grabbing; }
+      #hud {
+        position: fixed; top: 10px; left: 10px; padding: 8px 10px;
+        font: 12px/1.45 ui-monospace, Menlo, monospace; color: #f2ead8;
+        background: rgba(20, 16, 12, 0.72); border: 1px solid rgba(242, 234, 216, 0.15);
+        border-radius: 4px; white-space: pre; pointer-events: none; user-select: none;
+      }
+      #loading {
+        position: fixed; inset: 0; display: grid; place-items: center;
+        font: 14px ui-monospace, Menlo, monospace; color: #f2ead8;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="hud"></div>
+    <div id="loading">generating village…</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
