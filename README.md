@@ -461,3 +461,7 @@ Thunder starts `0.15 + distance / 220` s after the flash (capped at 3 s), so dis
 - **Light budget.** 48 point lights per frame, each with a ray-marched shadow, evaluated for every pixel. A tiled or clustered light list would be the next step.
 - **Weather is screen-local.** Particles exist only in a box around the camera, and lightning strikes near it. Swaying vegetation doesn't sway its shadow (the heightmap is static), and snow and puddles are a per-pixel look, not geometry.
 - **Depth range.** Clip-space depth is `depth / 8192`, which caps the camera-relative depth range at about ±8192 world units. That is plenty for a 1024-unit world, but would need revisiting for larger ones.
+
+## License
+
+[MIT](LICENSE)
