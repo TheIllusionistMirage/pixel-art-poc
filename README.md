@@ -4,6 +4,10 @@ A proof of concept for a pixel-art engine. It procedurally generates a medieval 
 
 TypeScript + raw WebGL2. No engine, no runtime dependencies.
 
+### Demo
+
+![Demo screenshot](demo.png)
+
 ```sh
 npm install
 npm run dev        # Vite dev server
