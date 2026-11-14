@@ -17,6 +17,8 @@ export const MAT = {
   FOLIAGE: 100,
   FIRE: 150,
   WINDOW: 200,
+  /** Characters: lit like SOLID, but weather (snow, puddles) leaves them alone. */
+  ACTOR: 254,
   SOLID: 255,
 } as const;
 
@@ -30,6 +32,12 @@ export class VoxelModel {
    * shades as a rounded form, the way a pixel artist would paint it.
    */
   normals: Float32Array | null = null;
+  /**
+   * Named points in voxel coordinates (continuous: a voxel spans [x, x+1)),
+   * e.g. a house's doorstep or chimney mouth. The atlas converts them to
+   * model-local world units.
+   */
+  anchors: Record<string, [number, number, number]> = {};
   /** Per-voxel priority used when overlapping shapes compete for a voxel. */
   private prio: Float32Array | null = null;
 
@@ -88,6 +96,11 @@ export class VoxelModel {
 
   clear(x: number, y: number, z: number): void {
     if (this.inside(x, y, z)) this.data[this.index(x, y, z) + 3] = 0;
+  }
+
+  /** Re-tag every voxel of material `from` as `to`. */
+  retag(from: number, to: number): void {
+    for (let i = 3; i < this.data.length; i += 4) if (this.data[i] === from) this.data[i] = to;
   }
 
   solid(x: number, y: number, z: number): boolean {

@@ -38,6 +38,17 @@ export interface RoadGraph {
   ringCount: number;
 }
 
+/** A house door villagers can shelter behind, attached to the road edge the house faces. */
+export interface Door {
+  /** Doorstep, world units. */
+  x: number;
+  y: number;
+  /** Road edge (node indices) and the parameter along a → b of the point opposite the door. */
+  a: number;
+  b: number;
+  t: number;
+}
+
 export interface World {
   size: number;
   /** RGBA8 ground albedo, DETAIL texels per world unit ((size·DETAIL)² texels); alpha = material. */
@@ -45,6 +56,9 @@ export interface World {
   statics: Placed[];
   lights: PointLight[];
   roads: RoadGraph;
+  doors: Door[];
+  /** Chimney mouths (world x, y, z) for smoke. */
+  chimneys: [number, number, number][];
   counts: Record<string, number>;
 }
 
@@ -78,6 +92,8 @@ export function generateVillage(lib: Library, seed = 7): World {
 
   const statics: Placed[] = [];
   const lights: PointLight[] = [];
+  const doors: Door[] = [];
+  const chimneys: [number, number, number][] = [];
   const footprints: { x: number; y: number; r: number }[] = [];
   const counts: Record<string, number> = {};
 
@@ -255,6 +271,17 @@ export function generateVillage(lib: Library, seed = 7): World {
         const a = facing(-nx, -ny) + range(rng, -0.05, 0.05);
         if (areaBusy(x, y, m.w / 2, m.d / 2, a) || collides(x, y, m.radius * 0.8)) continue;
         place(name, x, y, a);
+        const { door, chimney } = m.anchors;
+        if (door) {
+          const [ox, oy] = rot(door[0], door[1], a);
+          const dx = x + ox, dy = y + oy;
+          const t = clamp(((dx - A.x) * ux + (dy - A.y) * uy) / len, 0.02, 0.98);
+          doors.push({ x: dx, y: dy, a: e.a, b: e.b, t });
+        }
+        if (chimney) {
+          const [ox, oy] = rot(chimney[0], chimney[1], a);
+          chimneys.push([x + ox, y + oy, chimney[2]]);
+        }
         if (rng() < 0.75) {
           const [ox, oy] = rot(4, m.d / 2 + 1, a);
           lights.push({ x: x + ox, y: y + oy, z: 10, radius: 46, color: WARM, flicker: 0.04, phase: rng() * 100 });
@@ -554,5 +581,5 @@ export function generateVillage(lib: Library, seed = 7): World {
   }
   for (let i = 0; i < GS * GS; i++) ground[i * 4 + 3] = mat[i];
 
-  return { size: S, ground, statics, lights, roads: { nodes, adj, ringCount: RING_N }, counts };
+  return { size: S, ground, statics, lights, roads: { nodes, adj, ringCount: RING_N }, doors, chimneys, counts };
 }

@@ -243,6 +243,7 @@ export function house(o: HouseOpts): VoxelModel {
       m.set(x, front, z, c);
     }
   m.box(dx0 - 1, front + 1, 0, dx0 + doorW + 1, front + 3, 1, (x, y, z) => jitter(C.stoneLight, 0.06, hash3(x, y, z, o.seed)));
+  m.anchors.door = [dx0 + doorW / 2, front + 2, 0];
 
   // ── Windows: mullion cross, frame, a sill; optional shutters and flower box.
   const shutterCol = pick(rng, SHUTTERS);
@@ -303,6 +304,7 @@ export function house(o: HouseOpts): VoxelModel {
           m.set(x, y, z, hole ? [30, 26, 24] : cap ? jitter(C.stoneLight, 0.05, n) : jitter(mortar ? C.mortar : C.stoneDark, 0.08, n));
         }
     }
+    m.anchors.chimney = [cx + 2.5, cy + 2.5, zTop + 1];
   }
   return m;
 }

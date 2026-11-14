@@ -6,7 +6,9 @@
 //                       sorting), writing albedo+material and normal+height.
 //  3. Lighting pass   – per low-res pixel: ambient + sun/moon (heightfield shadow)
 //                       + point lights (heightfield shadows), emissives.
-//  4. Blit            – nearest-neighbour upscale to the canvas.
+//  4. Effects         – weather drawn over the lit frame, depth-tested against
+//                       the G-buffer depth: chimney smoke, rain, snow, lightning.
+//  5. Blit            – nearest-neighbour upscale to the canvas.
 //
 // Geometry and lighting only meet through the G-buffer, so the geometry path
 // (slice quads) can be swapped for meshes later without touching lighting.
@@ -15,10 +17,12 @@ import type { Atlas, ModelInfo } from '../assets/atlas';
 import { DETAIL } from '../assets/voxel';
 import type { DayLighting } from '../world/daycycle';
 import type { Placed, PointLight } from '../world/village';
+import { RAIN_CARRY, SNOW_CARRY, type WeatherFrame } from '../world/weather';
 import { framebuffer, program, texture, type GL, type Program } from './gl';
 import * as SH from './shaders';
 
-const FLOATS_PER_INSTANCE = 8;
+/** x, y, angle, slice z · atlas u, v, w, h · sway */
+export const FLOATS_PER_INSTANCE = 9;
 const BYTES_PER_INSTANCE = FLOATS_PER_INSTANCE * 4;
 const CHUNK = 128;
 /** Heightmap window: world units covered, and texels (one per voxel column). */
@@ -29,6 +33,19 @@ const HM_SNAP = 256;
 const CULL_MARGIN = 48;
 /** Tallest model, in world units. Objects below the screen can poke up into it. */
 const MAX_HEIGHT = 80;
+/** Precipitation: particles fall from this height (world units) through a box around the view. */
+const PRECIP_TOP = 90;
+const RAIN_DENSITY = 0.02; // drops per square world unit at full rain
+const SNOW_DENSITY = 0.03;
+const MAX_PARTICLES = 20000;
+/** Point-light grid cell size, world units. */
+const LIGHT_CELL = 32;
+/** Point-light brightness at full night. */
+const LIGHT_GAIN = 1.35;
+
+/** Smoke puffs alive per chimney, and how long each lives (seconds). */
+const SMOKE_PUFFS = 20;
+const SMOKE_LIFE = 7;
 
 export interface View {
   x: number;
@@ -57,6 +74,7 @@ export interface FrameInput {
   debug: number;
   shadows: boolean;
   dynamic: { data: Float32Array; count: number };
+  weather: WeatherFrame;
 }
 
 export interface FrameStats {
@@ -77,8 +95,24 @@ export function writeInstances(out: Float32Array, o: number, m: ModelInfo, x: nu
     out[o++] = s.v;
     out[o++] = m.tw;
     out[o++] = m.td;
+    out[o++] = m.sway;
   }
   return o;
+}
+
+/**
+ * Returns a function that moves a world point to the nearest point that lands on
+ * a whole screen pixel for this view. Applied to the camera and to anything that
+ * moves, so moving sprites step a pixel at a time instead of resampling their
+ * slices at a new sub-pixel phase every frame (which makes rows pop in and out).
+ */
+export function pixelSnapper(v: View): (x: number, y: number) => { x: number; y: number; px: number; py: number } {
+  const c = Math.cos(v.angle), s = Math.sin(v.angle), k = Math.tan(v.pitch);
+  return (x, y) => {
+    const px = Math.round((c * x + s * y) * DETAIL), py = Math.round((-s * x + c * y) * k * DETAIL);
+    const rx = px / DETAIL, ry = py / (k * DETAIL);
+    return { x: c * rx - s * ry, y: s * rx + c * ry, px, py };
+  };
 }
 
 /** Static instances bucketed into world chunks, stored contiguously row by row
@@ -134,6 +168,14 @@ export class Renderer {
   private readonly heightProg: Program;
   private readonly lightProg: Program;
   private readonly blitProg: Program;
+  private readonly precipProg: Program;
+  private readonly smokeProg: Program;
+  private readonly boltProg: Program;
+  private readonly haloProg: Program;
+  private readonly smokeVao: WebGLVertexArrayObject;
+  private readonly chimneyCount: number;
+  private readonly boltVao: WebGLVertexArrayObject;
+  private readonly boltBuf: WebGLBuffer;
   private readonly albedoTex: WebGLTexture;
   private readonly normalTex: WebGLTexture;
   private readonly groundTex: WebGLTexture;
@@ -157,9 +199,15 @@ export class Renderer {
   private gFb!: WebGLFramebuffer;
   private litTex!: WebGLTexture;
   private litFb!: WebGLFramebuffer;
+  /** Lit colour + G-buffer depth, for the effects pass. */
+  private fxFb!: WebGLFramebuffer;
 
-  private readonly lightPos = new Float32Array(SH.MAX_LIGHTS * 4);
-  private readonly lightCol = new Float32Array(SH.MAX_LIGHTS * 4);
+  /** Point lights as GPU data + a world-space grid of per-cell light lists (rebuilt when the light array changes). */
+  private lightsFor: PointLight[] | null = null;
+  private lightCount = 0;
+  private lightTex: WebGLTexture[] = [];
+  private lightGrid: [number, number, number] = [0, 0, LIGHT_CELL];
+  private lightGridSize: [number, number] = [0, 0];
 
   constructor(
     private readonly gl: GL,
@@ -167,11 +215,16 @@ export class Renderer {
     private readonly worldSize: number,
     ground: Uint8Array,
     placed: Placed[],
+    chimneys: [number, number, number][],
   ) {
     this.gbufProg = program(gl, SH.GBUFFER_VS, SH.GBUFFER_FS);
     this.heightProg = program(gl, SH.HEIGHT_VS, SH.HEIGHT_FS);
     this.lightProg = program(gl, SH.FULLSCREEN_VS, SH.LIGHTING_FS);
     this.blitProg = program(gl, SH.FULLSCREEN_VS, SH.BLIT_FS);
+    this.precipProg = program(gl, SH.PRECIP_VS, SH.PRECIP_FS);
+    this.smokeProg = program(gl, SH.SMOKE_VS, SH.SMOKE_FS);
+    this.boltProg = program(gl, SH.BOLT_VS, SH.BOLT_FS);
+    this.haloProg = program(gl, SH.HALO_VS, SH.HALO_FS);
 
     this.albedoTex = texture(gl, atlas.width, atlas.height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, atlas.albedo);
     this.normalTex = texture(gl, atlas.width, atlas.height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, atlas.normal);
@@ -184,7 +237,7 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-    for (const loc of [1, 2]) {
+    for (const loc of [1, 2, 3]) {
       gl.enableVertexAttribArray(loc);
       gl.vertexAttribDivisor(loc, 1);
     }
@@ -194,11 +247,30 @@ export class Renderer {
     this.groundBuf = gl.createBuffer()!;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.groundBuf);
     const gt = worldSize * DETAIL; // ground texture size in texels
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([worldSize / 2, worldSize / 2, 0, 0, 0, 0, gt, gt]), gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([worldSize / 2, worldSize / 2, 0, 0, 0, 0, gt, gt, 0]), gl.STATIC_DRAW);
     this.dynBuf = gl.createBuffer()!;
 
+    // Smoke: one vec4 (x, y, z, phase seed) per chimney, shared by SMOKE_PUFFS instances.
+    this.chimneyCount = chimneys.length;
+    this.smokeVao = gl.createVertexArray()!;
+    gl.bindVertexArray(this.smokeVao);
+    const chimBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, chimBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(chimneys.flatMap(([x, y, z], i) => [x, y, z, ((i * 0.618034) % 1)])), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(0, SMOKE_PUFFS);
+
+    this.boltVao = gl.createVertexArray()!;
+    gl.bindVertexArray(this.boltVao);
+    this.boltBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.boltBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
     const hm = () => {
-      const tex = texture(gl, HM_SIZE, HM_SIZE, gl.R8, gl.RED, gl.UNSIGNED_BYTE);
+      // r: top of the column, g: 1 - bottom (see HEIGHT_FS). Both combine with MAX blending.
+      const tex = texture(gl, HM_SIZE, HM_SIZE, gl.RG8, gl.RG, gl.UNSIGNED_BYTE);
       return { tex, fb: framebuffer(gl, [tex]) };
     };
     this.hmStatic = hm();
@@ -224,6 +296,7 @@ export class Renderer {
     if (this.gFb) {
       gl.deleteFramebuffer(this.gFb);
       gl.deleteFramebuffer(this.litFb);
+      gl.deleteFramebuffer(this.fxFb);
       gl.deleteTexture(this.gAlbedo);
       gl.deleteTexture(this.gNormal);
       gl.deleteTexture(this.litTex);
@@ -237,15 +310,13 @@ export class Renderer {
     this.gFb = framebuffer(gl, [this.gAlbedo, this.gNormal], this.gDepth);
     this.litTex = texture(gl, w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
     this.litFb = framebuffer(gl, [this.litTex]);
+    this.fxFb = framebuffer(gl, [this.litTex], this.gDepth);
   }
 
   /** Camera position snapped to whole pixels in screen space, to avoid shimmer while panning.
    *  Returns the snapped world position and that position in screen pixels. */
   snappedCamera(v: View): { x: number; y: number; px: number; py: number } {
-    const c = Math.cos(v.angle), s = Math.sin(v.angle), k = Math.tan(v.pitch);
-    const px = Math.round((c * v.x + s * v.y) * DETAIL), py = Math.round((-s * v.x + c * v.y) * k * DETAIL);
-    const rx = px / DETAIL, ry = py / (k * DETAIL);
-    return { x: c * rx - s * ry, y: s * rx + c * ry, px, py };
+    return pixelSnapper(v)(v.x, v.y);
   }
 
   /** World-space AABB of everything that can appear on screen. */
@@ -273,6 +344,7 @@ export class Renderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.vertexAttribPointer(1, 4, gl.FLOAT, false, BYTES_PER_INSTANCE, first * BYTES_PER_INSTANCE);
     gl.vertexAttribPointer(2, 4, gl.FLOAT, false, BYTES_PER_INSTANCE, first * BYTES_PER_INSTANCE + 16);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, BYTES_PER_INSTANCE, first * BYTES_PER_INSTANCE + 32);
   }
 
   private bindTex(unit: number, tex: WebGLTexture, loc: WebGLUniformLocation | undefined): void {
@@ -357,6 +429,8 @@ export class Renderer {
     gl.uniform2f(gp.u.u_res, w, h);
     gl.uniform1f(gp.u.u_tilt, tilt);
     gl.uniform1f(gp.u.u_detail, DETAIL);
+    gl.uniform2fv(gp.u.u_wind, f.weather.wind);
+    gl.uniform1f(gp.u.u_time, f.time);
 
     // Ground: a single huge "slice" at z = 0 with a flat normal.
     gl.uniform2f(gp.u.u_atlasSize, this.worldSize * DETAIL, this.worldSize * DETAIL);
@@ -380,6 +454,8 @@ export class Renderer {
     gl.disable(gl.DEPTH_TEST);
 
     // ── 3. Lighting ─────────────────────────────────────────────────────
+    // (Before any binding: creating textures binds them to the active unit.)
+    this.uploadLights(f.lights);
     gl.bindVertexArray(this.emptyVao);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.litFb);
     gl.viewport(0, 0, w, h);
@@ -405,13 +481,32 @@ export class Renderer {
     gl.uniform1f(lp.u.u_time, f.time);
     gl.uniform1i(lp.u.u_debug, f.debug);
     gl.uniform1i(lp.u.u_shadows, f.shadows ? 1 : 0);
-    stats.lights = this.packLights(f, vis, view);
-    gl.uniform1i(lp.u.u_numLights, stats.lights);
-    gl.uniform4fv(lp.u.u_lightPos, this.lightPos);
-    gl.uniform4fv(lp.u.u_lightCol, this.lightCol);
+    stats.lights = L.night < 0.01 ? 0 : this.countLights(f.lights, vis);
+    this.bindTex(3, this.lightTex[0], lp.u.u_lightData);
+    this.bindTex(4, this.lightTex[1], lp.u.u_lightCells);
+    this.bindTex(5, this.lightTex[2], lp.u.u_lightIndex);
+    gl.uniform3fv(lp.u.u_lightGrid, this.lightGrid);
+    gl.uniform2iv(lp.u.u_lightGridSize, this.lightGridSize);
+    gl.uniform1f(lp.u.u_lightScale, L.night < 0.01 ? 0 : L.night * LIGHT_GAIN);
+    const W = f.weather;
+    gl.uniform2f(lp.u.u_viewCS, Math.cos(view.pitch), Math.sin(view.pitch));
+    gl.uniform1f(lp.u.u_cloud, W.cloud);
+    gl.uniform2fv(lp.u.u_cloudOffset, W.cloudOffset);
+    gl.uniform1f(lp.u.u_wet, W.wetness);
+    gl.uniform1f(lp.u.u_rain, W.rain);
+    gl.uniform1f(lp.u.u_snowCover, W.snowCover);
+    gl.uniform1f(lp.u.u_fog, W.fog);
+    gl.uniform1f(lp.u.u_mist, W.mist);
+    gl.uniform4fv(lp.u.u_mistA, W.mistA);
+    gl.uniform4fv(lp.u.u_mistB, W.mistB);
+    gl.uniform2fv(lp.u.u_mistW, W.mistW);
+    gl.uniform3fv(lp.u.u_fogColor, W.fogColor);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    // ── 4. Upscale to canvas ────────────────────────────────────────────
+    // ── 4. Weather effects ──────────────────────────────────────────────
+    this.drawEffects(f, view, cam, tilt, camRot, hmb);
+
+    // ── 5. Upscale to canvas ────────────────────────────────────────────
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvasSize[0], this.canvasSize[1]);
     gl.useProgram(this.blitProg.prog);
@@ -422,24 +517,210 @@ export class Renderer {
     return stats;
   }
 
-  /** Pick the lights that can affect the screen (nearest first) and pack them into uniform arrays. */
-  private packLights(f: FrameInput, vis: Bounds, view: View): number {
-    const intensity = f.lighting.night;
-    if (intensity < 0.01) return 0;
-    const candidates = f.lights.filter(
-      (l) => l.x + l.radius > vis.minX && l.x - l.radius < vis.maxX && l.y + l.radius > vis.minY && l.y - l.radius < vis.maxY,
-    );
-    candidates.sort((a, b) => Math.hypot(a.x - view.x, a.y - view.y) - Math.hypot(b.x - view.x, b.y - view.y));
-    const n = Math.min(candidates.length, SH.MAX_LIGHTS);
-    for (let i = 0; i < n; i++) {
-      const l = candidates[i];
-      const fl = l.flicker
-        ? 1 + l.flicker * (0.6 * Math.sin(f.time * 11 + l.phase) + 0.4 * Math.sin(f.time * 23.7 + l.phase * 1.7))
-        : 1;
-      const k = intensity * fl * 1.35;
-      this.lightPos.set([l.x, l.y, l.z, l.radius * (0.97 + 0.03 * fl)], i * 4);
-      this.lightCol.set([l.color[0] * k, l.color[1] * k, l.color[2] * k, l.overhang ?? 0], i * 4);
+  private drawEffects(
+    f: FrameInput,
+    view: View,
+    cam: { px: number; py: number },
+    tilt: number,
+    camRot: [number, number],
+    hmb: Bounds,
+  ): void {
+    const gl = this.gl;
+    const W = f.weather, L = f.lighting;
+    const [w, h] = this.res;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fxFb);
+    gl.viewport(0, 0, w, h);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.depthMask(false);
+    const common = (p: Program) => {
+      gl.useProgram(p.prog);
+      gl.uniform2f(p.u.u_res, w, h);
+      gl.uniform1f(p.u.u_detail, DETAIL);
+      gl.uniform1f(p.u.u_tilt, tilt);
+      gl.uniform2f(p.u.u_camRot, camRot[0], camRot[1]);
+      gl.uniform2f(p.u.u_cam, view.x, view.y);
+    };
+    // Particles take the scene's light (and a share of the fog colour) rather than being lit per pixel.
+    const lit = (albedo: [number, number, number], direct: number, fogMix: number): [number, number, number] =>
+      albedo.map((a, i) => {
+        const v = a * (L.ambient[i] + L.lightColor[i] * direct * (1 - 0.85 * W.cloud));
+        return v + (W.fogColor[i] - v) * Math.min(1, W.fog + 0.6 * W.mist) * fogMix;
+      }) as [number, number, number];
+
+    // Lamp haloes in fog / rain mist: additive, not depth-tested. Scaled by 0.9 to
+    // match the grade the lit image has already been through.
+    const veil = W.fog + 0.6 * W.mist;
+    if (this.lightCount && L.night >= 0.01 && veil > 0.01) {
+      const p = this.haloProg;
+      common(p);
+      this.bindTex(0, this.lightTex[0], p.u.u_lightData);
+      gl.uniform1f(p.u.u_time, f.time);
+      gl.uniform1f(p.u.u_amount, L.night * LIGHT_GAIN * veil * 0.22 * 0.9);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.ONE, gl.ONE, gl.ZERO, gl.ONE);
+      gl.bindVertexArray(this.emptyVao);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.lightCount);
+      gl.disable(gl.BLEND);
+      gl.enable(gl.DEPTH_TEST);
     }
+
+    // Smoke
+    if (this.chimneyCount && W.smoke > 0.01) {
+      const p = this.smokeProg;
+      common(p);
+      gl.uniform1i(p.u.u_K, SMOKE_PUFFS);
+      gl.uniform1f(p.u.u_life, SMOKE_LIFE);
+      gl.uniform1f(p.u.u_time, f.time);
+      gl.uniform2fv(p.u.u_wind, W.wind);
+      gl.uniform1f(p.u.u_amount, W.smoke);
+      gl.uniform2i(p.u.u_camPix, cam.px, cam.py);
+      // Smoke stays greyish even under the blue night ambient.
+      const sc = lit([0.78, 0.77, 0.76], 0.6, 0.5);
+      const sl = (sc[0] + sc[1] + sc[2]) / 3;
+      gl.uniform3fv(p.u.u_color, sc.map((v) => sl + (v - sl) * 0.35));
+      gl.bindVertexArray(this.smokeVao);
+      gl.drawArraysInstanced(gl.POINTS, 0, 1, this.chimneyCount * SMOKE_PUFFS);
+    }
+
+    // Rain and snow
+    const rain = W.rain > 0.01, snow = W.snow > 0.01;
+    if (rain || snow) {
+      const p = this.precipProg;
+      common(p);
+      gl.bindVertexArray(this.emptyVao);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      // The box (camera-rotated frame) that covers every position a falling particle can be seen at.
+      const bx = w / DETAIL + 8;
+      const halfH = h / 2 / DETAIL;
+      const lo = -halfH / tilt - 4, hi = (halfH + PRECIP_TOP) / tilt + 4;
+      const area = bx * (hi - lo);
+      const [c, s] = camRot;
+      gl.uniform1f(p.u.u_time, f.time);
+      gl.uniform2f(p.u.u_wind, c * W.wind[0] + s * W.wind[1], -s * W.wind[0] + c * W.wind[1]);
+      const drift = (d: [number, number], carry: number): void => {
+        gl.uniform2f(p.u.u_drift, c * d[0] + s * d[1], -s * d[0] + c * d[1]);
+        gl.uniform1f(p.u.u_carry, carry);
+      };
+      gl.uniform2f(p.u.u_camR, c * view.x + s * view.y, -s * view.x + c * view.y);
+      gl.uniform4f(p.u.u_box, -bx / 2, lo, bx, hi - lo);
+      gl.uniform1f(p.u.u_top, PRECIP_TOP);
+      this.bindTex(0, this.hmFinal.tex, p.u.u_height);
+      gl.uniform2f(p.u.u_hmOrigin, hmb.minX, hmb.minY);
+      gl.uniform1f(p.u.u_hmSize, HM_WORLD);
+      if (rain) {
+        const n = Math.min(MAX_PARTICLES, Math.round(RAIN_DENSITY * W.rain * area));
+        const col = lit([0.62, 0.68, 0.76], 0.3, 0.3);
+        gl.uniform1i(p.u.u_mode, 0);
+        drift(W.rainDrift, RAIN_CARRY);
+        gl.uniform4f(p.u.u_color, col[0] + 0.06 + W.flash * 0.5, col[1] + 0.07 + W.flash * 0.5, col[2] + 0.09 + W.flash * 0.6, 1);
+        gl.drawArraysInstanced(gl.LINES, 0, 2, n);
+      }
+      if (snow) {
+        const n = Math.min(MAX_PARTICLES, Math.round(SNOW_DENSITY * W.snow * area));
+        const col = lit([0.95, 0.96, 1.0], 0.5, 0.25);
+        gl.uniform1i(p.u.u_mode, 1);
+        drift(W.snowDrift, SNOW_CARRY);
+        gl.uniform4f(p.u.u_color, col[0] + 0.05, col[1] + 0.05, col[2] + 0.06, 1);
+        gl.drawArraysInstanced(gl.POINTS, 0, 1, n);
+      }
+      gl.disable(gl.BLEND);
+    }
+
+    // Lightning bolt: a white core with a pale-violet edge one pixel to the side.
+    if (W.bolt) {
+      const p = this.boltProg;
+      common(p);
+      gl.bindVertexArray(this.boltVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.boltBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, W.bolt, gl.DYNAMIC_DRAW);
+      const n = W.bolt.length / 3;
+      gl.uniform2f(p.u.u_offset, 1, 0);
+      gl.uniform4f(p.u.u_color, 0.72, 0.7, 1, 1);
+      gl.drawArrays(gl.LINES, 0, n);
+      gl.uniform2f(p.u.u_offset, 0, 0);
+      gl.uniform4f(p.u.u_color, 1, 1, 1, 1);
+      gl.drawArrays(gl.LINES, 0, n);
+    }
+
+    gl.depthMask(true);
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindVertexArray(this.emptyVao);
+  }
+
+  /** Lights whose reach overlaps the visible bounds (for the HUD). */
+  private countLights(lights: PointLight[], vis: Bounds): number {
+    let n = 0;
+    for (const l of lights)
+      if (l.x + l.radius > vis.minX && l.x - l.radius < vis.maxX && l.y + l.radius > vis.minY && l.y - l.radius < vis.maxY) n++;
     return n;
+  }
+
+  /**
+   * Upload the lights and bin them into a world-space grid: each cell lists every
+   * light whose (largest, flickering) radius reaches into it. The lighting shader
+   * looks up its pixel's cell and only visits that list, so there is no cap on
+   * lights on screen and the cost doesn't grow with zoom.
+   */
+  private uploadLights(lights: PointLight[]): void {
+    if (this.lightsFor === lights) return;
+    const gl = this.gl;
+    this.lightsFor = lights;
+    for (const t of this.lightTex) gl.deleteTexture(t);
+    const n = lights.length;
+    const reach = (l: PointLight) => l.radius * (1 + 0.03 * l.flicker);
+
+    const data = new Float32Array(Math.max(1, n) * 12);
+    lights.forEach((l, i) => data.set([l.x, l.y, l.z, l.radius, ...l.color, l.overhang ?? 0, l.flicker, l.phase, 0, 0], i * 12));
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const l of lights) {
+      const r = reach(l);
+      minX = Math.min(minX, l.x - r); minY = Math.min(minY, l.y - r);
+      maxX = Math.max(maxX, l.x + r); maxY = Math.max(maxY, l.y + r);
+    }
+    const C = LIGHT_CELL;
+    const gw = n ? Math.ceil((maxX - minX) / C) : 0, gh = n ? Math.ceil((maxY - minY) / C) : 0;
+    const lists: number[][] = Array.from({ length: gw * gh }, () => []);
+    lights.forEach((l, i) => {
+      const r = reach(l);
+      const cx0 = Math.max(0, Math.floor((l.x - r - minX) / C)), cx1 = Math.min(gw - 1, Math.floor((l.x + r - minX) / C));
+      const cy0 = Math.max(0, Math.floor((l.y - r - minY) / C)), cy1 = Math.min(gh - 1, Math.floor((l.y + r - minY) / C));
+      for (let cy = cy0; cy <= cy1; cy++)
+        for (let cx = cx0; cx <= cx1; cx++) {
+          // Keep only cells the light's disc actually touches.
+          const nx = Math.max(minX + cx * C, Math.min(l.x, minX + (cx + 1) * C));
+          const ny = Math.max(minY + cy * C, Math.min(l.y, minY + (cy + 1) * C));
+          if (Math.hypot(nx - l.x, ny - l.y) <= r) lists[cy * gw + cx].push(i);
+        }
+    });
+    const cells = new Int32Array(Math.max(1, gw * gh) * 2);
+    const index: number[] = [];
+    lists.forEach((list, c) => {
+      if (list.length > SH.MAX_CELL_LIGHTS) {
+        // Too crowded: keep the lights nearest the cell centre.
+        console.warn(`light grid cell ${c} has ${list.length} lights; keeping ${SH.MAX_CELL_LIGHTS}`);
+        const mx = minX + ((c % gw) + 0.5) * C, my = minY + (Math.floor(c / gw) + 0.5) * C;
+        const d = (i: number) => Math.hypot(lights[i].x - mx, lights[i].y - my);
+        list.sort((a, b) => d(a) - d(b)).length = SH.MAX_CELL_LIGHTS;
+      }
+      cells[c * 2] = index.length;
+      cells[c * 2 + 1] = list.length;
+      index.push(...list);
+    });
+    const iw = SH.LIGHT_INDEX_W, ih = Math.max(1, Math.ceil(index.length / iw));
+    const idx = new Int32Array(iw * ih);
+    idx.set(index);
+
+    this.lightTex = [
+      texture(gl, 3, Math.max(1, n), gl.RGBA32F, gl.RGBA, gl.FLOAT, data),
+      texture(gl, Math.max(1, gw), Math.max(1, gh), gl.RG32I, gl.RG_INTEGER, gl.INT, cells),
+      texture(gl, iw, ih, gl.R32I, gl.RED_INTEGER, gl.INT, idx),
+    ];
+    this.lightCount = n;
+    this.lightGrid = [minX, minY, C];
+    this.lightGridSize = [gw, gh];
   }
 }

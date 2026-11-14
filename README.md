@@ -1,6 +1,6 @@
 # pixel-art-poc
 
-A proof of concept for a pixel-art engine. It procedurally generates a medieval village and renders it as **sprite stacks**: every object is a pile of flat, horizontal image slices. The scene is lit by a deferred renderer that does a day/night cycle, cel-banded shading, heightfield shadows, and many flickering point lights at night. The whole frame is rendered at low resolution and upscaled with nearest-neighbour filtering, so each art pixel stays crisp.
+A proof of concept for a pixel-art engine. It procedurally generates a medieval village and renders it as **sprite stacks**: every object is a pile of flat, horizontal image slices. The scene is lit by a deferred renderer that does a day/night cycle, cel-banded shading, heightfield shadows, and many flickering point lights at night. Selectable weather (from clear through rain and thunderstorms to snow and blizzards) changes the light, wets or snows over the surfaces, bends the vegetation and sends villagers indoors, with procedural sound. The whole frame is rendered at low resolution and upscaled with nearest-neighbour filtering, so each art pixel stays crisp.
 
 TypeScript + raw WebGL2. No engine, no runtime dependencies.
 
@@ -28,11 +28,15 @@ npm run typecheck
 | space | pause the clock |
 | G | cycle debug views: final → albedo → normals → height → sun shadow → light only |
 | H | toggle shadows |
+| C / shift+C | next / previous crowd density |
 | R | reset camera |
+| **weather** dropdown (top right) | Clear, Cloudy, Overcast, Fog, Light rain, Rain, Thunderstorm, Light snow, Snow, Blizzard. Changes crossfade over a few seconds |
+| **crowd** button | cycle villager density: none → sparse (35%) → normal → busy (2.5×) → crowded (5×), relative to the `villagers` count. Changes apply instantly |
+| **sound** button | mute / unmute the procedural weather audio (audio starts after the first click or key press) |
 
 ### URL parameters
 
-`seed` (village layout, default 7), `villagers` (count, default 180), `t` (start hour), `speed` (game hours per real second), `paused`, `zoom`, `pitch` (degrees), `rot` (radians), `x` / `y` (camera position), `debug` (debug view index), `noshadows`, `capture` (preserve the drawing buffer for screenshots).
+`seed` (village layout, default 7), `villagers` (count at normal density, default 180; 5× that are allocated for the crowded level), `crowd` (starting density, 0–4, default 2 = normal), `t` (start hour), `speed` (game hours per real second), `weather` (starting preset id: `clear`, `fog`, `rain`, …), `paused`, `zoom`, `pitch` (degrees), `rot` (radians), `x` / `y` (camera position), `debug` (debug view index), `noshadows`, `capture` (preserve the drawing buffer for screenshots).
 
 Example: `/?seed=42&t=20&pitch=45&villagers=2000`
 
@@ -45,20 +49,21 @@ The rest of this document explains the rendering technique and the maths behind 
 ```
  startup (CPU, once)                                    per frame
  ───────────────────                                    ─────────
- models.ts   voxel models ─┐                            villagers.update(dt)
-                           ├─ atlas.ts ─► slice atlas ─┐        │
- village.ts  placements, ──┘   (albedo + normal)       │        ▼
-             ground texture, lights, road graph ───────┼─► Renderer.render
-                                                       │   1. heightmap   (top-down, MAX blend)
-                                                       │   2. G-buffer    (instanced slices, depth test)
- daycycle.ts hour ─► sun/moon dir, colours ────────────┘   3. lighting    (full-screen pass)
-                                                           4. blit        (nearest-neighbour upscale)
+ models.ts   voxel models ─┐                            weather.update(dt) ─► thunder ─► weatherAudio
+                           ├─ atlas.ts ─► slice atlas ─┐ villagers.update(dt, shelter)
+ village.ts  placements, ──┘   (albedo + normal)       │        │
+             ground texture, lights, road graph, ──────┼─► Renderer.render
+             doors, chimneys                           │   1. heightmap   (top-down, MAX blend)
+                                                       │   2. G-buffer    (instanced slices, depth test, wind sway)
+ daycycle.ts hour ─► sun/moon dir, colours ─┐          │   3. lighting    (full-screen pass, + weather)
+ weather.ts  ─► folded into the lighting ───┴──────────┘   4. effects     (smoke, rain, snow, lightning)
+                                                           5. blit        (nearest-neighbour upscale)
 ```
 
 | File | Role |
 |---|---|
 | [src/main.ts](src/main.ts) | Startup, input, camera, frame loop, HUD |
-| [src/engine/renderer.ts](src/engine/renderer.ts) | The four render passes, culling, chunked instance buffers |
+| [src/engine/renderer.ts](src/engine/renderer.ts) | The five render passes, culling, chunked instance buffers |
 | [src/engine/shaders.ts](src/engine/shaders.ts) | All GLSL; the projection is documented at the top |
 | [src/engine/gl.ts](src/engine/gl.ts) | Thin WebGL2 helpers (shader, program, texture, framebuffer) |
 | [src/engine/rng.ts](src/engine/rng.ts) | Seeded PRNG, integer hash, value noise, fBm |
@@ -68,7 +73,9 @@ The rest of this document explains the rendering technique and the maths behind 
 | [src/assets/library.ts](src/assets/library.ts) | Builds every model variant once and packs the atlas |
 | [src/world/village.ts](src/world/village.ts) | Procedural village layout and ground texture |
 | [src/world/daycycle.ts](src/world/daycycle.ts) | Time of day → light direction and colours |
-| [src/sim/villagers.ts](src/sim/villagers.ts) | Villagers walking the road graph |
+| [src/world/weather.ts](src/world/weather.ts) | Weather presets, crossfade, wetness/snow cover, wind, lightning |
+| [src/sim/villagers.ts](src/sim/villagers.ts) | Villagers walking the road graph, sheltering indoors in bad weather |
+| [src/audio/weatherAudio.ts](src/audio/weatherAudio.ts) | Procedural WebAudio: rain, wind, thunder |
 
 ### Coordinate conventions
 
@@ -176,11 +183,12 @@ Everything except the final blit renders into textures of size $\lceil \text{can
 
 ### Instancing
 
-Every slice is one instance of a unit quad (4-vertex triangle strip). An instance is 8 floats:
+Every slice is one instance of a unit quad (4-vertex triangle strip). An instance is 9 floats:
 
 ```
 a_inst0 = (world x, world y, angle, slice z in voxels)
 a_inst1 = (atlas u, atlas v, width, height in texels)
+a_sway  = wind response of the model (0 = rigid), see "Weather"
 ```
 
 The vertex shader (`sliceWorldPos`) scales the unit quad to the slice's size in world units, rotates it by the instance angle, translates it to the instance position, and then applies the projection above.
@@ -252,7 +260,15 @@ Ground pixels also get contact occlusion. `groundOcclusion` samples the heightma
 
 #### Point lights
 
-Up to 48 lights per frame (`MAX_LIGHTS`). On the CPU, `packLights` keeps lights whose radius overlaps the visible bounds and takes the 48 nearest the camera. Each light's flicker is the sum of two incommensurate sines:
+There is no limit on how many lights can be on screen. When the light list changes, `uploadLights` builds three textures:
+
+- **Light data**: a float texture with 3 texels per light: position and radius, colour and overhang, and flicker amount and phase.
+- **Light grid**: one texel per 32-unit cell of a world-space grid, holding `(first, count)`. A cell lists every light whose largest (flickering) radius touches it.
+- **Index**: the concatenated per-cell lists.
+
+The lighting shader finds the cell under its surface point and visits only that list, so its cost depends on how many lights overlap one spot, not on zoom. That's at most 64 per cell, with a warning if a cell would hold more. An earlier version passed the 48 lights nearest the camera as uniforms. Zoomed out, that lit only a disc around the screen centre, and the disc followed the camera as you panned.
+
+Flicker is computed in the shader as the sum of two incommensurate sines:
 
 ```math
 f = 1 + a\,\bigl(0.6\sin(11t + \phi) + 0.4\sin(23.7t + 1.7\phi)\bigr)
@@ -294,7 +310,11 @@ If the pixel is more than 7 units in front of any neighbour, it is a silhouette 
 
 `G` cycles through raw albedo, normals, height ($z/70$), the directional shadow × ndl term, and lighting without albedo. These are the quickest way to see what each stage contributes.
 
-### Pass 4: blit
+### Pass 4: effects
+
+Rain, snow, chimney smoke and lightning, drawn into the lit image against the G-buffer depth. See [Effects pass](#effects-pass) under Weather.
+
+### Pass 5: blit
 
 Nearest-neighbour upscale of the lit low-res texture to the canvas, described above.
 
@@ -370,6 +390,68 @@ The ground is painted at `DETAIL` texels per world unit (2048² texels) like a p
 - turns smoothly: the angle error is wrapped to $(-\pi, \pi]$ with `atan2(sin Δ, cos Δ)` and reduced by a factor of $\min(1, 10\,dt)$ per frame;
 - animates with the walk cycle `[0, 1, 0, 2]`, advancing one frame per 2.5 units walked, so the feet match ground speed. Each frame is its own voxel model in the atlas.
 
+**Sheltering.** Each villager has a fixed `hardiness` ∈ [0, 1) and goes indoors while the weather's `shelter` value exceeds it, so a preset's `shelter` is roughly the share of people who leave the streets. Each also has a reaction delay of 0.5–6 s (doubled for coming back out) so the crowd thins and returns gradually. Every house records its door (a model anchor, rotated into the world) and the road edge it faces, with the parameter $t$ of the point opposite the door. A villager heading in:
+
+1. picks the nearest door, and routes along the road graph using a shortest-path tree grown outward from that door's spot on its edge (Dijkstra, computed lazily and cached per door);
+2. turns around if the way behind is shorter, walks the roads, and on the door's edge stops at $t$;
+3. walks straight to the doorstep, then disappears (`hidden`, skipped when building instance data).
+
+Coming out reverses the last step: from the doorstep to the road point, then back to wandering. Villagers walk faster while heading in, and those still outside hurry in the rain.
+
+---
+
+## 7. Weather
+
+[weather.ts](src/world/weather.ts) describes each preset with seven intensities in [0, 1]: `cloud`, `rain`, `snow`, `fog`, `wind`, `lightning` and `shelter`. Selecting a preset only changes the target. The live values ease towards it exponentially ($\tau = 2.2$ s), so every effect below crossfades on its own without extra code. A few quantities integrate over time on top of that:
+
+- **Wetness** rises while it rains (full in about 7 s of heavy rain) and dries over about a minute. Melting snow adds to it.
+- **Snow cover** grows while it snows, up to a cap that depends on how hard it snows, and melts once it stops (faster in rain).
+- **Wind** is the preset strength times a gust factor (a few summed sines whose depth grows with the wind), along a slowly wandering direction. The cloud layer's offset integrates the wind, so cloud shadows drift with it.
+- **Lightning** is a Poisson process (about one strike every 6 s in a full storm). A strike gets a random distance from the camera; the flash (a main stroke plus one or two re-strokes, each a 55 ms exponential decay) is weaker for far strikes. A strike within 240 units also produces a visible bolt: a jagged line list from 190 units up down to the ground, with a branch or two. Each strike is handed to the audio as a thunder event.
+
+### Light
+
+`Weather.light` modifies the day/night lighting before it reaches the renderer. Cloud desaturates the ambient and adds part of the sun colour to it, as light scattered by the cloud layer. Rain, storms and blizzards darken everything. A flash adds a blue-white boost to ambient and sky. `night` is raised in gloomy weather, so lamps and windows come on during a daytime storm.
+
+### Surfaces (lighting pass)
+
+All of these skip water, fire, windows and villagers (a new `ACTOR` material id, lit exactly like `SOLID`).
+
+- **Cloud shadows**: two octaves of value noise over $p_{xy} + \text{cloudOffset}$, thresholded with a threshold that falls as `cloud` rises, with soft edges. This scales only the direct light, so full overcast is evenly flat, while Cloudy (`cloud` 0.5) leaves about half the ground in drifting sunlight.
+- **Snow** replaces the albedo where the normal faces up ($\text{smoothstep}(0.35, 0.75, n_z)$) and two octaves of noise fall under the cover amount. Roofs, canopies and the ground fill in; walls stay clear. Bare roads (non-grassy ground) get about half as much, so they look trodden and slushy.
+- **Wet**: albedo darkens (less on foliage). On bare ground, noise below `wetness × 0.42` becomes a **puddle** that mirrors the sky. Wet surfaces get stepped Blinn highlights from the sun and from every point light, which gives reflections of the lamps on wet cobbles at night. Puddles use a noise-perturbed normal and a sharper exponent.
+- **Ripples**: on water and puddles, a world-aligned grid of 7-texel cells. Each cell is active with probability ∝ `rain` and holds an expanding one-pixel ring with a hashed phase.
+- **Rain mist**: `mist = 0.55 · rain^1.3`, applied like fog but built from rain: spray hugging the ground ($e^{-z/6}$) and broad sheets of rain, bands of noise stretched across the wind that sweep downwind at a speed set by the wind. The motion is integrated on the CPU (an offset advanced by the wind velocity each frame), never computed as `time × speed`: with a gusting speed, that product jumps back and forth by `time × Δspeed`. The sheets are stretched along the wind, so turning the stretch with the wind would swing distant mist around. Instead there are two layers half a cycle apart that crossfade every 10 s. Each layer picks up the current wind direction only while its weight is zero, and the blend is renormalised so its contrast doesn't dip. Light rain only gives a faint haze, while a storm greys out the distance in moving curtains. Lamp halos and particle colours count the mist as 0.6 of fog.
+- **Fog**: `fog × (0.3 + 0.7·far) × height falloff × drifting noise`, where `far` is the pixel's view depth $r_y + z\,k$ normalised over the screen. Lamps glow through it. The halos are drawn in the effects pass, one additive quad per light (instanced, reading the light data texture), 3σ wide around the lamp's projected position.
+
+Low-contrast terms (fog, cloud edges) are deliberately *not* dithered. A dithered veil at a few percent covers the whole screen in a sparse dot pattern. Highlights are hard-stepped, so faint ones vanish instead of sparkling.
+
+### Wind sway
+
+Models carry a `flex` (oak 1.6, pine 1.4, bush 0.5, reed 2.2, tall grass 1.6), stored as `sway = flex / top²`. The G-buffer vertex shader shifts each slice by $\text{wind} \cdot \text{sway} \cdot z^2 \cdot \text{wobble}$, rounded to whole pixels. The trunk base stays put, the top moves by `wind · flex` world units, and slices never smear. The wobble is a couple of sines with a per-plant phase from its position. The heightmap is not swayed, so shadows stay put.
+
+### Effects pass
+
+A fifth pass draws into the lit image with the G-buffer depth attached (test on, write off), so particles go behind roofs and trees correctly. All of them use the G-buffer's projection and depth, snapped to pixel centres. They are lit with a flat colour from the CPU (ambient + some sun + flash, mixed towards the fog colour).
+
+- **Rain** (`LINES`) and **snow** (`POINTS`, 1–2 px) need no vertex buffers. Each instance hashes `gl_InstanceID` into a fixed world position inside a box around the camera, measured in the camera-rotated frame. The box is wrapped with `mod`, and its edges sit just off-screen for every height, so wrapping is never visible. A particle's height is a sawtooth in time from 90 units down, and it gets a new hashed position for each fall. Sideways drift is the wind integrated over time on the CPU, one offset for rain and one for snow, shared by every particle and added before the wrap. It is not `wind × fall time` per particle: a gust would scale that for the whole field at once, and snow, which falls for about 6 s, visibly rocked back and forth. The vertex shader samples the heightmap under the particle. Below the surface, snow is clipped and rain draws a 3-pixel splash for 90 ms. The particle count scales with intensity and with the box area.
+- **Chimney smoke** (`POINTS`): `house` models record a chimney anchor, and each chimney feeds 20 puffs through an attribute divisor of 20. A puff's age is `fract(time / 7 s + k / 20 + seed)`. Puffs rise, grow from 2 to about 10 px and drift downwind. Strong wind flattens the plume and tears it apart sooner. The fragment shader cuts a dithered disc whose coverage falls with age and radius.
+- **Lamp halos** in fog and rain mist: see Fog above.
+- **Lightning**: the bolt's line list, drawn twice: white, and pale violet one pixel to the side.
+
+### Sound
+
+[weatherAudio.ts](src/audio/weatherAudio.ts) builds everything from two looping noise buffers (white and brown, generated at startup):
+
+| Sound | Graph | Level |
+|---|---|---|
+| rain hiss | white → high-pass 900 Hz → low-pass 7 kHz | $0.22\,\text{rain}^{0.7}$ |
+| rain body | brown → low-pass 500 Hz | $0.35\,\text{rain}^{1.2}$ |
+| wind | brown → band-pass swept by the gust (220–740 Hz) | $0.5\,\text{wind}^{1.4}\cdot\text{gust}$ |
+| thunder | close strikes: a 0.35 s high-passed crack; always: a 3.5–6 s low-passed brown-noise rumble with a ragged random envelope | ∝ strike strength |
+
+Thunder starts `0.15 + distance / 220` s after the flash (capped at 3 s), so distant strikes rumble later and duller. The low-pass cutoff falls with distance. Levels follow the weather through `setTargetAtTime`, which makes them crossfade as well. Everything goes through a master gain (the mute button) and a compressor. Browsers allow audio only after a user gesture, so the `AudioContext` is created on the first click, key press or dropdown change.
+
 ---
 
 ## Known limitations
@@ -377,4 +459,5 @@ The ground is painted at `DETAIL` texels per world unit (2048² texels) like a p
 - **Heightfield, not volume.** Shadows and occlusion see the world as a 2.5D height map, so there are no overhangs (except the per-light `overhang` workaround), and a bridge would shadow like a wall.
 - **Height precision.** Heights are stored in 8 bits of voxels, so the maximum is 255 voxels (127.5 world units). Culling and the shadow march also assume nothing is taller than about 80 (`MAX_HEIGHT`, and the `q.z > 90` early-out).
 - **Light budget.** 48 point lights per frame, each with a ray-marched shadow, evaluated for every pixel. A tiled or clustered light list would be the next step.
+- **Weather is screen-local.** Particles exist only in a box around the camera, and lightning strikes near it. Swaying vegetation doesn't sway its shadow (the heightmap is static), and snow and puddles are a per-pixel look, not geometry.
 - **Depth range.** Clip-space depth is `depth / 8192`, which caps the camera-relative depth range at about ±8192 world units. That is plenty for a 1024-unit world, but would need revisiting for larger ones.

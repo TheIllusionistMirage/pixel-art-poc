@@ -28,6 +28,13 @@ export interface ModelInfo {
   slices: SliceRect[];
   /** Footprint radius in world units, for culling and placement. */
   radius: number;
+  /** Named points (see VoxelModel.anchors) in model-local world units, before placement rotation. */
+  anchors: Record<string, [number, number, number]>;
+  /**
+   * Wind response: slice z (voxels) is displaced by wind · sway · z², so the top
+   * slice moves by wind · flex. 0 = rigid.
+   */
+  sway: number;
 }
 
 export interface Atlas {
@@ -67,15 +74,45 @@ function normalAt(m: VoxelModel, x: number, y: number, z: number): [number, numb
         nz += dz * w;
       }
   const len = Math.hypot(nx, ny, nz);
-  if (len < 1e-3) return [0, 0, 1];
+  if (len < 1e-3) return buriedNormal(m, x, y, z);
   return [nx / len, ny / len, nz / len];
 }
 
-export function buildAtlas(entries: { name: string; model: VoxelModel }[], width = 4096): Atlas {
+/**
+ * A voxel with no empty neighbour can still show: a slice's edge row covers less
+ * than a pixel when the camera is tilted (and rotated slices stair-step), so some
+ * pixel columns sample the voxel just behind a wall face, and every slice repeats
+ * the same pattern, which makes a full-height stripe. Point it at the nearest open
+ * space in its own layer (2–3 voxels out) so it shades like the face in front of it.
+ */
+function buriedNormal(m: VoxelModel, x: number, y: number, z: number): [number, number, number] {
+  for (let r = 2; r <= 3; r++) {
+    let nx = 0, ny = 0;
+    for (let dy = -r; dy <= r; dy++)
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r || occ(m, x + dx, y + dy, z)) continue;
+        const w = 1 / Math.hypot(dx, dy);
+        nx += dx * w;
+        ny += dy * w;
+      }
+    const len = Math.hypot(nx, ny);
+    if (len > 1e-3) return [nx / len, ny / len, 0];
+  }
+  return [0, 0, 1];
+}
+
+export interface AtlasEntry {
+  name: string;
+  model: VoxelModel;
+  /** How far the top of the stack bends in the wind, relative to other models (0 = rigid). */
+  flex?: number;
+}
+
+export function buildAtlas(entries: AtlasEntry[], width = 4096): Atlas {
   // Pass 1: shelf-pack every non-empty slice.
   let px = 0, py = 0, rowH = 0;
   const models: ModelInfo[] = [];
-  for (const { name, model: m } of entries) {
+  for (const { name, model: m, flex = 0 } of entries) {
     if (m.w + PAD > width) throw new Error(`model ${name} wider than atlas`);
     const slices: SliceRect[] = [];
     for (let z = 0; z < m.h; z++) {
@@ -89,10 +126,15 @@ export function buildAtlas(entries: { name: string; model: VoxelModel }[], width
       px += m.w + PAD;
       rowH = Math.max(rowH, m.d);
     }
+    const anchors: ModelInfo['anchors'] = {};
+    for (const [k, [ax, ay, az]] of Object.entries(m.anchors)) anchors[k] = [(ax - m.w / 2) / DETAIL, (ay - m.d / 2) / DETAIL, az / DETAIL];
+    const top = slices.length ? slices[slices.length - 1].z : 1;
     models.push({
       id: models.length, name, slices,
       w: m.w / DETAIL, d: m.d / DETAIL, h: m.h / DETAIL, tw: m.w, td: m.d,
       radius: Math.hypot(m.w, m.d) / 2 / DETAIL,
+      anchors,
+      sway: flex / (top * top),
     });
   }
   const height = py + rowH + PAD;
