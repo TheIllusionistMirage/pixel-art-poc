@@ -101,6 +101,10 @@ void main() {
  * g = 1 - bottom of the lowest one. Each column is then treated as solid from
  * its bottom to its top, so light can pass under eaves and canopies instead of
  * every overhang counting as a wall down to the ground.
+ *
+ * Things in the air (flying birds) go in a second interval, b / a, so a bird
+ * passing over a roof doesn't fuse with it into one tall solid column. Only
+ * shadows look at that interval; ambient occlusion and rain clipping use r.
  */
 export const HEIGHT_VS = /* glsl */ `#version 300 es
 precision highp float;
@@ -122,12 +126,14 @@ void main() {
 export const HEIGHT_FS = /* glsl */ `#version 300 es
 precision highp float;
 uniform sampler2D u_albedo;
+uniform int u_layer;   // 0 = ground-based (rg), 1 = airborne (ba)
 in vec2 v_uv;
 flat in float v_z;
 out vec4 o;
 void main() {
   if (texture(u_albedo, v_uv).a < 0.01) discard;
-  o = vec4(v_z / 255.0, (256.0 - v_z) / 255.0, 0.0, 1.0);  // slice v_z spans voxels [v_z - 1, v_z]
+  vec2 span = vec2(v_z / 255.0, (256.0 - v_z) / 255.0);  // slice v_z spans voxels [v_z - 1, v_z]
+  o = u_layer == 0 ? vec4(span, 0.0, 0.0) : vec4(0.0, 0.0, span);
 }
 `;
 
@@ -196,9 +202,10 @@ float heightAt(vec2 w) {
 bool blocked(vec3 q) {
   vec2 uv = (q.xy - u_hmOrigin) / u_hmSize;
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return false;
-  vec2 c = texture(u_height, uv).rg * 255.0;
-  float top = c.x / u_detail, bottom = (255.0 - c.y) / u_detail;
-  return top > q.z + 0.5 && bottom < q.z + 0.5;
+  vec4 c = texture(u_height, uv) * 255.0;
+  float z = q.z + 0.5;
+  vec2 top = c.xz / u_detail, bottom = (255.0 - c.yw) / u_detail;
+  return (top.x > z && bottom.x < z) || (top.y > z && bottom.y < z);
 }
 ${FLICKER}
 float hash12(vec2 p) {

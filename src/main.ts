@@ -1,9 +1,11 @@
 import { buildLibrary } from './assets/library';
 import { DETAIL } from './assets/voxel';
+import { BirdAudio } from './audio/birdAudio';
 import { WeatherAudio } from './audio/weatherAudio';
 import { FLOATS_PER_INSTANCE, PITCH_MAX, PITCH_MIN, Renderer, pixelSnapper, writeInstances, type View } from './engine/renderer';
+import { Birds } from './sim/birds';
 import { Villagers } from './sim/villagers';
-import { dayLighting } from './world/daycycle';
+import { dayLighting, sunHeight } from './world/daycycle';
 import { generateVillage } from './world/village';
 import { Weather, WEATHER } from './world/weather';
 
@@ -29,7 +31,8 @@ await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 const t0 = performance.now();
 const lib = buildLibrary(1);
 const t1 = performance.now();
-const world = generateVillage(lib, num('seed', 7));
+const seed = num('seed', 7);
+const world = generateVillage(lib, seed);
 const t2 = performance.now();
 // Crowd density: the `villagers` param is the "normal" count; the pool is sized for the busiest level.
 const CROWD = [
@@ -41,6 +44,7 @@ const CROWD = [
 ];
 const baseVillagers = Math.max(0, num('villagers', 180));
 const villagers = new Villagers(world.roads, world.doors, Math.round(baseVillagers * CROWD[CROWD.length - 1].k), lib.villagers.length);
+const birds = new Birds(world.birds, [world.size / 2, world.size / 2], seed);
 const renderer = new Renderer(gl, lib.atlas, world.size, world.ground, world.statics, world.chimneys);
 const t3 = performance.now();
 loading.remove();
@@ -85,6 +89,7 @@ resize();
 const weather = new Weather();
 if (params.has('weather')) weather.set(params.get('weather')!, true);
 const audio = new WeatherAudio();
+const birdAudio = new BirdAudio(audio);
 const weatherSelect = document.getElementById('weather') as HTMLSelectElement;
 const soundButton = document.getElementById('sound') as HTMLButtonElement;
 const crowdButton = document.getElementById('crowd') as HTMLButtonElement;
@@ -175,6 +180,8 @@ canvas.addEventListener('wheel', (e) => {
 
 // ── Loop ────────────────────────────────────────────────────────────────
 const villagerSlices = Math.max(...lib.villagers.flat().map((n) => lib.atlas.byName.get(n)!.slices.length));
+const rookModels = lib.rooks.map((n) => lib.atlas.byName.get(n)!);
+const rookSlices = Math.max(...rookModels.map((m) => m.slices.length));
 let dynData = new Float32Array(1024 * FLOATS_PER_INSTANCE);
 let last = performance.now();
 let time = 0;
@@ -198,13 +205,16 @@ function frame(now: number) {
   if (!state.paused) state.hour = (state.hour + state.daySpeed * dt) % 24;
 
   weather.update(dt, time, view.x, view.y);
-  for (const s of weather.takeStrikes()) audio.thunder(s);
+  const strikes = weather.takeStrikes();
+  for (const s of strikes) audio.thunder(s);
   const W = weather.cur;
   villagers.update(dt, W.shelter, Math.max(W.rain, W.snow * W.wind));
+  birds.update(dt, { hour: state.hour, sun: sunHeight(state.hour), shelter: W.shelter, wind: weather.wind, time, strikes });
+  birdAudio.play(birds.takeSounds(), view);
 
   // Moving entities → instance data (culled to the heightmap window, which contains the screen).
   const hmb = renderer.heightmapBounds(view);
-  const need = villagers.active * villagerSlices * FLOATS_PER_INSTANCE;
+  const need = (villagers.active * villagerSlices + birds.count * rookSlices) * FLOATS_PER_INSTANCE;
   if (dynData.length < need) dynData = new Float32Array(need);
   const snap = pixelSnapper(view);
   let o = 0;
@@ -217,6 +227,23 @@ function frame(now: number) {
     const p = snap(x, y);
     o = writeInstances(dynData, o, m, p.x, p.y, villagers.angle[i]);
   }
+  // Birds: the ones on the ground or perched first, then everything in the air
+  // (the renderer puts the last `flyers` instances in the heightmap's airborne layer).
+  const lift = 1 / Math.tan(view.pitch);
+  let flyerStart = o;
+  for (let pass = 0; pass < 2; pass++) {
+    if (pass === 1) flyerStart = o;
+    for (let i = 0; i < birds.count; i++) {
+      if (!birds.visible(i) || birds.airborne(i) !== (pass === 1)) continue;
+      const x = birds.x[i], y = birds.y[i];
+      // Something high up is drawn well above its ground point: widen the cull by that much.
+      const mz = birds.z[i] * lift + 4;
+      if (x < hmb.minX - mz || y < hmb.minY - mz || x > hmb.maxX + mz || y > hmb.maxY + mz) continue;
+      const p = snap(x, y);
+      o = writeInstances(dynData, o, rookModels[birds.frame[i]], p.x, p.y, birds.angle[i], Math.round(birds.z[i] * DETAIL));
+    }
+  }
+  const flyers = (o - flyerStart) / FLOATS_PER_INSTANCE;
 
   const lighting = weather.light(dayLighting(state.hour));
   audio.update({ rain: W.rain, snow: W.snow, wind: W.wind, gust: weather.gust });
@@ -228,7 +255,7 @@ function frame(now: number) {
     time,
     debug: state.debug,
     shadows: state.shadows,
-    dynamic: { data: dynData, count: instances },
+    dynamic: { data: dynData, count: instances, flyers },
     weather: weather.frame(lighting),
   });
   cpuMs = cpuMs * 0.9 + (performance.now() - cpuStart) * 0.1;
@@ -249,6 +276,7 @@ function frame(now: number) {
       `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}  ${lighting.phase}${state.paused ? '  (paused)' : `  ×${(state.daySpeed * 8).toFixed(2)}`}`,
       `${fps.toFixed(0)} fps   cpu ${cpuMs.toFixed(1)} ms   ${rw}×${rh} @${state.zoom}x`,
       `objects ${world.statics.length}   villagers ${villagers.active} (${CROWD[state.crowd].label})   lights ${stats.lights}`,
+      `birds ${birds.count} in ${birds.flockCount} flocks (${birds.flying} flying${birds.hiddenCount ? `, ${birds.hiddenCount} sheltering` : ''})`,
       `slices drawn ${stats.instances.toLocaleString()} / ${(renderer.staticInstanceCount + instances).toLocaleString()}   draws ${stats.drawCalls}`,
       `weather ${weather.preset.label}${weather.transitioning ? ' (changing)' : ''}   wind ${Math.hypot(...weather.wind).toFixed(2)}   wet ${(weather.wetness * 100).toFixed(0)}%   snow ${(weather.snowCover * 100).toFixed(0)}%   indoors ${villagers.indoors()}`,
       `view: ${DEBUG_VIEWS[state.debug]}${state.shadows ? '' : '  (shadows off)'}   pitch ${(view.pitch / DEG).toFixed(0)}°`,

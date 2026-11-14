@@ -47,6 +47,21 @@ export class WeatherAudio {
     return this.muted;
   }
 
+  /** The shared AudioContext, once unlocked (other sound sources play through it). */
+  get context(): AudioContext | null {
+    return this.ctx;
+  }
+
+  /** Master bus: follows the mute button and feeds the compressor. */
+  get bus(): AudioNode {
+    return this.master;
+  }
+
+  /** A 2 s loop of white noise. */
+  get noise(): AudioBuffer {
+    return this.white;
+  }
+
   /** Call from a user gesture. Safe to call repeatedly. */
   unlock(): void {
     if (this.ctx) {

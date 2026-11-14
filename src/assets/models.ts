@@ -459,33 +459,120 @@ const barkFill = (seed: number, base: RGB = C.bark): Fill => (x, y, z) => {
   return jitter(shade(base, groove ? 0.78 : knot ? 0.86 : 1), 0.03, hash3(x, y, z, seed));
 };
 
-export function oak(seed: number): VoxelModel {
+/** k scales the whole tree (1 = the regular forest oak; rookeries use bigger ones). */
+export function oak(seed: number, k = 1): VoxelModel {
   const rng = mulberry32(seed);
-  const m = new VoxelModel(76, 76, 88);
-  const c = 38;
+  const W = Math.round(76 * k);
+  const m = new VoxelModel(W, W, Math.round(88 * k));
+  const c = W / 2;
   const bark = barkFill(seed);
-  for (let z = 0; z < 52; z++) disc(m, c, c, z, 3.3 + (z < 6 ? (6 - z) * 0.5 : 0) - z * 0.012, bark);
+  for (let z = 0; z < 52 * k; z++) {
+    const zz = z / k;
+    disc(m, c, c, z, (3.3 + (zz < 6 ? (6 - zz) * 0.5 : 0) - zz * 0.012) * k, bark);
+  }
   for (let i = 0, n = irange(rng, 4, 5); i < n; i++) {
-    const a = (i / n) * Math.PI * 2 + range(rng, -0.4, 0.4), len = range(rng, 6, 9);
-    line(m, [c, c, 2.5], [c + Math.cos(a) * len, c + Math.sin(a) * len, 0.5], 1.3, bark);
+    const a = (i / n) * Math.PI * 2 + range(rng, -0.4, 0.4), len = range(rng, 6, 9) * k;
+    line(m, [c, c, 2.5], [c + Math.cos(a) * len, c + Math.sin(a) * len, 0.5], 1.3 * k, bark);
   }
   for (let i = 0, n = irange(rng, 3, 4); i < n; i++) {
     const a = rng() * Math.PI * 2;
-    line(m, [c, c, range(rng, 28, 36)], [c + Math.cos(a) * 15, c + Math.sin(a) * 15, 47], 1.4, bark);
+    line(m, [c, c, range(rng, 28, 36) * k], [c + Math.cos(a) * 15 * k, c + Math.sin(a) * 15 * k, 47 * k], 1.4 * k, bark);
   }
   const dark: RGB = [50, 82, 58], light: RGB = [112, 140, 68];
   const lump = (x: number, y: number, z: number, r: number, rz: number, i: number) =>
-    blob(m, x, y, z, r, r * range(rng, 0.9, 1.05), rz, seed + i, leafFill(dark, light, (z / S - 21) / 14 + range(rng, -0.06, 0.06), seed + i), MAT.FOLIAGE, 0.16);
+    blob(m, x, y, z * k, r * k, r * k * range(rng, 0.9, 1.05), rz * k, seed + i, leafFill(dark, light, (z / S - 21) / 14 + range(rng, -0.06, 0.06), seed + i), MAT.FOLIAGE, 0.16);
   const n = irange(rng, 6, 8);
   for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2 + range(rng, -0.3, 0.3), d = range(rng, 14, 20);
+    const a = (i / n) * Math.PI * 2 + range(rng, -0.3, 0.3), d = range(rng, 14, 20) * k;
     lump(c + Math.cos(a) * d, c + Math.sin(a) * d, range(rng, 44, 54), range(rng, 12, 15), range(rng, 10, 12), i);
   }
   lump(c, c, 60, range(rng, 17, 20), 13, 20);
   for (let i = 0; i < 3; i++) {
     const a = rng() * Math.PI * 2;
-    lump(c + Math.cos(a) * 10, c + Math.sin(a) * 10, range(rng, 66, 72), range(rng, 10, 13), 9, 30 + i);
+    lump(c + Math.cos(a) * 10 * k, c + Math.sin(a) * 10 * k, range(rng, 66, 72), range(rng, 10, 13), 9, 30 + i);
   }
+  return m;
+}
+
+/** Highest solid layer per column (-1 = empty column). */
+function topSurface(m: VoxelModel): Int16Array {
+  const top = new Int16Array(m.w * m.d).fill(-1);
+  for (let y = 0; y < m.d; y++)
+    for (let x = 0; x < m.w; x++)
+      for (let z = m.h - 1; z >= 0; z--)
+        if (m.solid(x, y, z)) {
+          top[y * m.w + x] = z;
+          break;
+        }
+  return top;
+}
+
+const TWIG: RGB = [80, 62, 48], TWIG_DARK: RGB = [56, 43, 36], TWIG_LIGHT: RGB = [108, 86, 62];
+
+/**
+ * A big oak holding a rookery: a few twig nests in the crown, and anchors
+ * `perch0..N` on the top of the canopy (and on the nest rims) where the rooks
+ * sit at night. Anchors are spread out so perched birds don't overlap.
+ */
+export function rookery(seed: number): VoxelModel {
+  const rng = mulberry32(seed + 77);
+  const k = 1.18;
+  const m = oak(seed, k);
+  const c = m.w / 2;
+  let top = topSurface(m);
+  let maxTop = 0;
+  for (const z of top) maxTop = Math.max(maxTop, z);
+  const high = (x: number, y: number, band: number) => top[y * m.w + x] >= maxTop - band;
+
+  // Nests: rough balls of sticks half sunk into the upper crown, a darker cup on top.
+  const nests: [number, number, number][] = [];
+  for (let tries = 0; tries < 200 && nests.length < irange(rng, 3, 5); tries++) {
+    const a = rng() * Math.PI * 2, d = range(rng, 6, 22);
+    const nx = Math.floor(c + Math.cos(a) * d), ny = Math.floor(c + Math.sin(a) * d);
+    if (!m.inside(nx, ny, 0) || !high(nx, ny, 20) || nests.some(([x, y]) => Math.hypot(x - nx, y - ny) < 12)) continue;
+    const nz = top[ny * m.w + nx];
+    const r = range(rng, 3.4, 4.6);
+    for (let z = nz - 2; z <= nz + 1; z++) {
+      const rr = r * (z === nz - 2 ? 0.7 : z === nz + 1 ? 0.95 : 1);
+      for (let y = Math.floor(ny - rr - 1); y <= ny + rr + 1; y++)
+        for (let x = Math.floor(nx - rr - 1); x <= nx + rr + 1; x++) {
+          const dx = x + 0.5 - (nx + 0.5), dy = y + 0.5 - (ny + 0.5);
+          const dd = Math.hypot(dx, dy);
+          if (dd > rr + (hash3(x, y, z, seed) - 0.5) * 1.4) continue;
+          const cup = z === nz + 1 && dd < rr - 1.6;
+          if (cup) continue; // the hollow of the cup
+          const h = hash3(x, y, z, seed + 5);
+          const col = z === nz && dd < rr - 1.4 ? TWIG_DARK : h > 0.8 ? TWIG_LIGHT : h < 0.25 ? TWIG_DARK : TWIG;
+          m.set(x, y, z, col);
+          m.setNormal(x, y, z, dx, dy, z - nz + 1.5);
+        }
+    }
+    // A few sticks poking out of the rim.
+    for (let i = 0; i < 5; i++) {
+      const sa = rng() * Math.PI * 2, len = r + range(rng, 1.5, 3);
+      line(m, [nx + 0.5, ny + 0.5, nz + 0.5], [nx + 0.5 + Math.cos(sa) * len, ny + 0.5 + Math.sin(sa) * len, nz + range(rng, -0.5, 1.5)], 0, () => TWIG_LIGHT);
+    }
+    nests.push([nx, ny, nz]);
+  }
+
+  // Perches: one on each nest rim, then the highest parts of the crown, kept apart.
+  top = topSurface(m);
+  const perches: [number, number][] = [];
+  for (const [nx, ny] of nests) {
+    const a = rng() * Math.PI * 2;
+    perches.push([Math.floor(nx + Math.cos(a) * 2.6), Math.floor(ny + Math.sin(a) * 2.6)]);
+  }
+  const cand: { x: number; y: number; s: number }[] = [];
+  for (let y = 2; y < m.d - 2; y++)
+    for (let x = 2; x < m.w - 2; x++)
+      if (high(x, y, 26)) cand.push({ x, y, s: top[y * m.w + x] + rng() * 6 });
+  cand.sort((a, b) => b.s - a.s);
+  for (const p of cand) {
+    if (perches.length >= 26) break;
+    if (perches.some(([x, y]) => Math.hypot(x - p.x, y - p.y) < 7)) continue;
+    perches.push([p.x, p.y]);
+  }
+  perches.forEach(([x, y], i) => (m.anchors[`perch${i}`] = [x + 0.5, y + 0.5, top[y * m.w + x] + 1]));
   return m;
 }
 
@@ -959,4 +1046,86 @@ export function randomHouseOpts(rng: Rng, seed: number): HouseOpts {
     chimney: rng() < 0.7,
     seed,
   };
+}
+
+// ── Birds ────────────────────────────────────────────────────────────────
+
+const ROOK = {
+  base: [40, 38, 48],
+  dark: [27, 26, 33],
+  sheen: [66, 62, 94],
+  face: [152, 146, 152],
+  beak: [84, 80, 90],
+  leg: [46, 42, 44],
+} as const satisfies Record<string, RGB>;
+
+/** Glossy black plumage: purple-blue sheen on top, darker underneath. */
+const plumage = (seed: number, zMid: number): Fill => (x, y, z) => {
+  const h = hash3(x, y, z, seed);
+  if (z < zMid) return h > 0.8 ? ROOK.base : ROOK.dark;
+  return h > 0.72 ? ROOK.sheen : h < 0.1 ? ROOK.dark : ROOK.base;
+};
+
+/**
+ * A rook in flight, facing +y. frame 0 = wings up, 1 = level (gliding),
+ * 2 = wings down; flapping cycles 0 1 2 1. Fingered primaries at the tips.
+ */
+export function rookFlying(frame: 0 | 1 | 2, seed: number): VoxelModel {
+  const m = new VoxelModel(19, 11, 9);
+  const c = 9.5, zb = 4;
+  blob(m, c, 5.4, zb + 0.5, 1.6, 3.0, 1.35, seed, plumage(seed, zb), MAT.SOLID, 0, 0.3);
+  blob(m, c, 8.3, zb + 0.7, 1.3, 1.4, 1.2, seed + 1, plumage(seed + 1, zb), MAT.SOLID, 0, 0.3);
+  m.set(9, 9, zb, ROOK.face);
+  m.set(9, 10, zb, ROOK.beak);
+  // Rounded, slightly fanned tail.
+  for (let y = 0; y < 3; y++)
+    for (let x = 9 - [2, 1, 1][y]; x <= 9 + [2, 1, 1][y]; x++)
+      m.set(x, y, zb, hash3(x, y, 0, seed) > 0.6 ? ROOK.base : ROOK.dark);
+  const elev = (d: number) => (frame === 0 ? 0.5 * d : frame === 1 ? 0.06 * d + Math.max(0, d - 6) * 0.2 : -0.42 * d);
+  for (const side of [-1, 1])
+    for (let i = 1; i <= 8; i++) {
+      const x = 9 + side * i, d = i;
+      const z = Math.round(zb + 0.5 + elev(d));
+      const slope = (elev(d + 0.5) - elev(d - 0.5)) * side;
+      const lead = 7.2 - 0.25 * d;
+      const chord = d < 5.5 ? 4 : 4 - (d - 5.5) * 0.55;
+      for (let y = Math.round(lead - chord); y <= Math.round(lead); y++) {
+        const row = Math.round(lead) - y; // 0 = leading edge
+        if (d > 6 && row > 0 && (row + i) % 2 === 1) continue; // gaps between the primaries
+        const h = hash3(x, y, frame, seed);
+        const col = row < 2 && d < 6 ? (h > 0.5 ? ROOK.sheen : ROOK.base) : h > 0.85 ? ROOK.base : ROOK.dark;
+        m.set(x, y, z, col);
+        m.setNormal(x, y, z, -slope, 0, 1);
+      }
+    }
+  return m;
+}
+
+/** A rook on the ground or a branch, facing +y. pose 0 = standing, 1 = pecking. */
+export function rookStanding(pose: 0 | 1, seed: number): VoxelModel {
+  const m = new VoxelModel(11, 13, 9);
+  const c = 5.5;
+  for (const lx of [4, 6]) {
+    m.set(lx, 6, 0, ROOK.leg);
+    m.set(lx, 7, 0, ROOK.leg);
+    m.set(lx, 6, 1, ROOK.leg);
+  }
+  if (pose === 0) {
+    blob(m, c, 4.8, 3.4, 1.7, 2.4, 1.5, seed, plumage(seed, 3), MAT.SOLID, 0, 0.3);
+    blob(m, c, 7.0, 4.4, 1.9, 2.0, 2.0, seed + 1, plumage(seed + 1, 4), MAT.SOLID, 0, 0.3);
+    blob(m, c, 8.9, 6.3, 1.4, 1.5, 1.4, seed + 2, plumage(seed + 2, 6), MAT.SOLID, 0, 0.3);
+    m.set(5, 10, 6, ROOK.face);
+    m.set(5, 11, 6, ROOK.beak);
+    m.set(5, 11, 5, ROOK.beak);
+    line(m, [c, 3, 3.6], [c, 0.6, 2.2], 0.9, () => ROOK.dark);
+  } else {
+    blob(m, c, 5.0, 4.2, 1.7, 2.4, 1.5, seed, plumage(seed, 4), MAT.SOLID, 0, 0.3);
+    blob(m, c, 7.3, 3.5, 1.9, 2.0, 1.8, seed + 1, plumage(seed + 1, 3), MAT.SOLID, 0, 0.3);
+    blob(m, c, 9.5, 2.2, 1.4, 1.5, 1.3, seed + 2, plumage(seed + 2, 2), MAT.SOLID, 0, 0.3);
+    m.set(5, 11, 1, ROOK.face);
+    m.set(5, 12, 0, ROOK.beak);
+    m.set(5, 11, 0, ROOK.beak);
+    line(m, [c, 3, 4.6], [c, 0.6, 5.6], 0.9, () => ROOK.dark);
+  }
+  return m;
 }

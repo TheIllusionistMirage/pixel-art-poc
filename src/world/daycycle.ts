@@ -53,6 +53,15 @@ function arc(phi: number, maxEl: number): { dir: Vec3; sinEl: number } {
   return { dir: [Math.cos(phi) * ce, -Math.sin(phi) * ce, sinEl], sinEl };
 }
 
+/**
+ * Sine of the sun's elevation at this hour: < 0 below the horizon, 0 at sunrise
+ * (06:00) and sunset (18:00), sin 62° ≈ 0.88 at noon. Anything that follows the
+ * sun (birds leaving and returning) keys off this, so it works at any day speed.
+ */
+export function sunHeight(hour: number): number {
+  return arc(((hour - 6) / 12) * Math.PI, SUN_MAX_EL).sinEl;
+}
+
 export function dayLighting(hour: number): DayLighting {
   hour = ((hour % 24) + 24) % 24;
   let k = 0;

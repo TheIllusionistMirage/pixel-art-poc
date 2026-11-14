@@ -1,6 +1,6 @@
 # pixel-art-poc
 
-A proof of concept for a pixel-art engine. It procedurally generates a medieval village and renders it as **sprite stacks**: every object is a pile of flat, horizontal image slices. The scene is lit by a deferred renderer that does a day/night cycle, cel-banded shading, heightfield shadows, and many flickering point lights at night. Selectable weather (from clear through rain and thunderstorms to snow and blizzards) changes the light, wets or snows over the surfaces, bends the vegetation and sends villagers indoors, with procedural sound. The whole frame is rendered at low resolution and upscaled with nearest-neighbour filtering, so each art pixel stays crisp.
+A proof of concept for a pixel-art engine. It procedurally generates a medieval village and renders it as **sprite stacks**: every object is a pile of flat, horizontal image slices. The scene is lit by a deferred renderer that does a day/night cycle, cel-banded shading, heightfield shadows, and many flickering point lights at night. Selectable weather (from clear through rain and thunderstorms to snow and blizzards) changes the light, wets or snows over the surfaces, bends the vegetation and sends villagers indoors, with procedural sound. Flocks of rooks live in rookeries at the forest edge: they leave at dawn to feed in the fields, return at dusk, and react to the weather. The whole frame is rendered at low resolution and upscaled with nearest-neighbour filtering, so each art pixel stays crisp.
 
 TypeScript + raw WebGL2. No engine, no runtime dependencies.
 
@@ -32,7 +32,7 @@ npm run typecheck
 | R | reset camera |
 | **weather** dropdown (top right) | Clear, Cloudy, Overcast, Fog, Light rain, Rain, Thunderstorm, Light snow, Snow, Blizzard. Changes crossfade over a few seconds |
 | **crowd** button | cycle villager density: none → sparse (35%) → normal → busy (2.5×) → crowded (5×), relative to the `villagers` count. Changes apply instantly |
-| **sound** button | mute / unmute the procedural weather audio (audio starts after the first click or key press) |
+| **sound** button | mute / unmute the procedural weather and bird audio (audio starts after the first click or key press) |
 
 ### URL parameters
 
@@ -49,11 +49,11 @@ The rest of this document explains the rendering technique and the maths behind 
 ```
  startup (CPU, once)                                    per frame
  ───────────────────                                    ─────────
- models.ts   voxel models ─┐                            weather.update(dt) ─► thunder ─► weatherAudio
-                           ├─ atlas.ts ─► slice atlas ─┐ villagers.update(dt, shelter)
- village.ts  placements, ──┘   (albedo + normal)       │        │
+ models.ts   voxel models ─┐                            weather.update(dt) ─► strikes ─► thunder ─► weatherAudio
+                           ├─ atlas.ts ─► slice atlas ─┐ villagers.update(dt, shelter)      │
+ village.ts  placements, ──┘   (albedo + normal)       │ birds.update(dt, sun, shelter, wind, strikes) ─► caws ─► birdAudio
              ground texture, lights, road graph, ──────┼─► Renderer.render
-             doors, chimneys                           │   1. heightmap   (top-down, MAX blend)
+             doors, chimneys, bird sites               │   1. heightmap   (top-down, MAX blend; flyers in their own layer)
                                                        │   2. G-buffer    (instanced slices, depth test, wind sway)
  daycycle.ts hour ─► sun/moon dir, colours ─┐          │   3. lighting    (full-screen pass, + weather)
  weather.ts  ─► folded into the lighting ───┴──────────┘   4. effects     (smoke, rain, snow, lightning)
@@ -68,14 +68,16 @@ The rest of this document explains the rendering technique and the maths behind 
 | [src/engine/gl.ts](src/engine/gl.ts) | Thin WebGL2 helpers (shader, program, texture, framebuffer) |
 | [src/engine/rng.ts](src/engine/rng.ts) | Seeded PRNG, integer hash, value noise, fBm |
 | [src/assets/voxel.ts](src/assets/voxel.ts) | `VoxelModel` authoring grid, material ids, `DETAIL` |
-| [src/assets/models.ts](src/assets/models.ts) | Procedural models (houses, church, trees, props, villagers) |
+| [src/assets/models.ts](src/assets/models.ts) | Procedural models (houses, church, trees, rookeries, props, villagers, rooks) |
 | [src/assets/atlas.ts](src/assets/atlas.ts) | Voxels → slice images packed into albedo and normal atlases |
 | [src/assets/library.ts](src/assets/library.ts) | Builds every model variant once and packs the atlas |
-| [src/world/village.ts](src/world/village.ts) | Procedural village layout and ground texture |
-| [src/world/daycycle.ts](src/world/daycycle.ts) | Time of day → light direction and colours |
+| [src/world/village.ts](src/world/village.ts) | Procedural village layout, bird sites and ground texture |
+| [src/world/daycycle.ts](src/world/daycycle.ts) | Time of day → light direction and colours, sun height |
 | [src/world/weather.ts](src/world/weather.ts) | Weather presets, crossfade, wetness/snow cover, wind, lightning |
 | [src/sim/villagers.ts](src/sim/villagers.ts) | Villagers walking the road graph, sheltering indoors in bad weather |
+| [src/sim/birds.ts](src/sim/birds.ts) | Rook flocks: roosting, dawn departure, foraging, dusk return, weather reactions |
 | [src/audio/weatherAudio.ts](src/audio/weatherAudio.ts) | Procedural WebAudio: rain, wind, thunder |
+| [src/audio/birdAudio.ts](src/audio/birdAudio.ts) | Procedural caws and wingbeats, positioned relative to the camera |
 
 ### Coordinate conventions
 
@@ -195,7 +197,7 @@ The vertex shader (`sliceWorldPos`) scales the unit quad to the slice's size in 
 
 **Static objects** are bucketed into 128×128-world-unit chunks at startup and written into one GPU buffer, chunk by chunk in row-major order. A visible rectangle of chunks is therefore one contiguous range *per chunk row*, and each row is a single `drawArraysInstanced` call. Nothing static is uploaded after startup.
 
-**Villagers** are rewritten into a dynamic buffer every frame: one instance per slice of their current animation frame, for those inside the heightmap window.
+**Villagers and birds** are rewritten into a dynamic buffer every frame: one instance per slice of their current animation frame, for those inside the heightmap window. A bird's altitude is added to each slice's z (rounded to whole voxels, so slices stay on their own pixel rows). Birds in the air are written last, so the renderer can treat the tail of the buffer as airborne (see the heightmap below).
 
 ### Culling
 
@@ -203,10 +205,11 @@ The vertex shader (`sliceWorldPos`) scales the unit quad to the slice's size in 
 
 ### Pass 1: heightmap
 
-A top-down orthographic render of every slice into an `R8` texture, with **`MAX` blending**. Each texel ends up holding the tallest surface above that point (in voxels, /255). The texture covers a 2048×2048-world-unit window around the camera, at one texel per voxel column. The window's origin snaps to a 256-unit grid.
+A top-down orthographic render of every slice with **`MAX` blending**. Each texel holds an interval of solid voxels: `r` is the top of the highest slice above that point (in voxels, /255) and `g` is 1 − the bottom of the lowest, so both combine with `MAX`. Shadow rays treat the column as solid only between the two, so light can pass under eaves and canopies. The texture covers a 2048×2048-world-unit window around the camera, at one texel per voxel column. The window's origin snaps to a 256-unit grid.
 
 - The static layer is cached and redrawn only when the window moves to a new grid cell.
-- Each frame the cache is copied (`blitFramebuffer`) into a second texture and the villagers are MAX-blended on top, so they cast shadows too.
+- Each frame the cache is copied (`blitFramebuffer`) into a second, `RGBA8` texture and the villagers and perched or feeding birds are MAX-blended on top, so they cast shadows too.
+- Flying birds go into the same kind of interval in `b` / `a` instead (`u_layer = 1`). In `r` / `g`, a bird flying over a roof would fuse with it into one column from the roof to the bird and cast a tall solid shadow. With its own interval the bird casts a small shadow of its own that slides across whatever is below it. Only the shadow test (`blocked`) reads `b` / `a`; ambient occlusion and the rain and snow clipping use `r`, so a passing bird doesn't darken the ground or stop the rain.
 
 This heightfield is the scene representation used for every shadow and occlusion query. Its limit is that it is 2.5D: anything under an overhang (a tree canopy) looks like the inside of a solid column. Point lights have an escape hatch for this (see `overhang` below).
 
@@ -450,7 +453,84 @@ A fifth pass draws into the lit image with the G-buffer depth attached (test on,
 | wind | brown → band-pass swept by the gust (220–740 Hz) | $0.5\,\text{wind}^{1.4}\cdot\text{gust}$ |
 | thunder | close strikes: a 0.35 s high-passed crack; always: a 3.5–6 s low-passed brown-noise rumble with a ragged random envelope | ∝ strike strength |
 
-Thunder starts `0.15 + distance / 220` s after the flash (capped at 3 s), so distant strikes rumble later and duller. The low-pass cutoff falls with distance. Levels follow the weather through `setTargetAtTime`, which makes them crossfade as well. Everything goes through a master gain (the mute button) and a compressor. Browsers allow audio only after a user gesture, so the `AudioContext` is created on the first click, key press or dropdown change.
+Thunder starts `0.15 + distance / 220` s after the flash (capped at 3 s), so distant strikes rumble later and duller. The low-pass cutoff falls with distance. Levels follow the weather through `setTargetAtTime`, which makes them crossfade as well. Everything goes through a master gain (the mute button) and a compressor. Browsers allow audio only after a user gesture, so the `AudioContext` is created on the first click, key press or dropdown change. The bird sounds (see [Birds](#8-birds)) share the same context, noise buffer and master gain.
+
+---
+
+## 8. Birds
+
+Rooks: noisy black crows that nest in colonies (*rookeries*) at the tops of tall trees, sleep there, and spend the day feeding on fields.
+
+### Sites
+
+[village.ts](src/world/village.ts) picks the sites after the rest of the village is laid out, using its own seeded RNG, so adding birds doesn't move anything else.
+
+- **Rookeries.** 3–5 sites spread around the village at 235–320 units from the centre, in the forest edge. Each site gets its own sector of the circle. If that sector has no ground clear of roads and buildings within 34 units, the site goes anywhere on the ring at least 140 units from the others. Each rookery is 2–3 `rookery` oaks about 21–26 units apart. Forest trees within 15 units of them are removed so the colony stands out.
+- **Forage patches.** Every field (shrunk by 4 units from the edges), plus up to 8 open meadows: 20×20-unit squares where the forest density is low, with no tree within 22 units.
+- **Cover.** Every oak, pine and rookery tree, with a point inside its crown at 62% of its height.
+
+### Models
+
+[models.ts](src/assets/models.ts):
+
+- **`rookery(seed)`** is an `oak(seed, 1.18)`: the same oak generator scaled 18% larger (trunk, roots, branches and canopy lumps), so it uses the same random sequence. On top of the crown it adds 3–5 twig nests: four layers of dark twig voxels with a hollow cup, plus a few loose sticks poking out, 6–22 voxels from the trunk, at least 12 voxels apart. It then picks up to 26 **perches**, one on each nest rim and the rest from the highest columns of the crown (at least 7 voxels apart), and records them as anchors (`perch0`, `perch1`, …) in model-local world units, like doors and chimneys.
+- **`rookFlying(frame)`** comes in three frames (wings up, level and down). It has a body, a head with a pale bare face and a grey beak, and a fanned tail. Each wing is a row of feathers whose elevation is a function of the distance $d$ from the body. Wings up rise as $0.5d$, level bend slightly at the tips, and down drop as $-0.42d$. Beyond $d = 6$ the primaries split into "fingers", like a real rook's. The feather normals follow the wing slope, so the wings catch the light as they flap.
+- **`rookStanding(pose)`** has two poses: standing, and pecking with the head down and the tail up.
+
+The plumage is near-black with a blue-violet sheen on the upper surfaces. The flap cycle is `[0, 1, 2, 1]`.
+
+### A day
+
+[birds.ts](src/sim/birds.ts) stores birds as struct-of-arrays, like the villagers. Each flock has 2–5 birds. Every bird owns one perch.
+
+The timetable is driven by **sun height** (`sunHeight(hour)`, the sine of the sun's elevation, from [daycycle.ts](src/world/daycycle.ts)), not the clock. It therefore works at any day speed, and jumping the hour with `,` / `.` puts the birds wherever they should be by then. Each flock draws its own thresholds, so flocks leave and return one after another:
+
+| Event | Sun height | Roughly |
+|---|---|---|
+| leave the roost | −0.10 … 0.04 | 05:35 – 06:10 |
+| head home | 0.24 … 0.10 | 16:55 – 17:35 |
+| stop wheeling and settle | −0.04 … −0.12 | 18:10 – 18:30 |
+
+1. **Night.** The birds sit on their perches. Their position is recomputed every frame with the same sway formula as the tree's vertex shader, so they ride the swaying crown. Now and then one turns round or hops to a free perch nearby. This happens more often, with more calling, in the half hour before it gets light.
+2. **Dawn.** The flock lifts off a few birds at a time over about 4 s, picks a forage patch near the rookery (one of the nearest few, with some randomness), and flies out at a cruising height of 64–76 units, high over the rooftops.
+3. **Day.** Near the patch the flock descends. Each bird lands on its own spot, roughly keeping its place in the flock. On the ground each bird pecks, hops (a short parabolic jump in the direction it faces), turns or stands still, and hops back if it wanders off the patch. Now and then a single bird flits up and lands 6–18 units away on the same patch. Every 12–35 s the whole flock takes off again. Most of these flights wander through 1–3 random waypoints 50–160 units apart, at random heights. About a third of the time the flock circles over the village instead, and some flights loop straight back to the patch they started from. Either way they end at a forage patch, so the birds spend a good part of the day in the air.
+4. **Dusk.** The flock flies home. Within 45 units of the rookery it **wheels**: it circles the trees, calling loudly, for at least 5 s and at most 30 s, until the sun drops below its settle threshold. Then each bird gets a random delay of 0–7 s and drops onto its own perch.
+
+### Flight
+
+Each flock has a virtual **leader**. It has a position, a heading and a speed, with a limited turn rate (1.2 rad/s) and acceleration, so the flock's path curves smoothly. Circling steers along the tangent of the circle, plus a pull back onto it.
+
+Every flying bird runs a loose boids-style rule:
+
+- It steers towards the leader plus its own fixed **offset** in the flock (a disc about $2.2\sqrt n$ units wide), with a slow wander added. The wander grows with the wind, so in a gale the flock is ragged.
+- It matches the leader's velocity.
+- It is pushed away from flockmates closer than 3 units, harder the closer they are.
+- The result is a desired velocity. The bird accelerates towards it with limited acceleration and a top speed of 52 units/s.
+
+Wind pushes everything in the air sideways (7 units/s per unit of wind). Birds face their velocity. They flap in bursts with glides in between, and always flap when climbing, slow, landing or working hard (high acceleration).
+
+**Landing** approaches from above: the bird aims at a point above its target whose height shrinks with the remaining distance, so it drops onto a perch instead of flying into the crown sideways. Perch targets are followed as they sway. A bird that hasn't arrived after 14 s snaps into place.
+
+### Weather
+
+- **Taking cover.** Each flock has a `hardiness` of 0.38–0.6, compared with the weather's `shelter` (with some hysteresis). This means rain, thunderstorms and blizzards drive every flock in, snow only some, and light rain none. A flock that is out flies to the nearest tree, the birds dive into the crown and disappear. At the roost, the birds huddle into the crown one by one. When the weather clears, they come back out and carry on (feed if it is day, otherwise go home).
+- **Lightning.** `Weather` records where each strike landed. A strike within $120 + 120\cdot\text{strength}$ units of a flock flushes it. Every bird bursts outward from the strike in a slightly random direction, panics for 1.2–2.6 s with alarm calls, and then the flock regroups and decides what to do (shelter, go home or feed).
+- **Wind.** It pushes flying birds sideways and makes the flock more ragged (see Flight). Perched birds sway with their tree.
+
+### Drawing
+
+A bird is drawn like a villager: one instance per slice of its current frame, with lighting, outline and shadows. Its altitude becomes a whole-voxel offset on each slice's z. Perched and feeding birds go into the ground heightmap layer, and flying birds into the airborne one (see [Pass 1](#pass-1-heightmap)). Their cull test is widened by the altitude divided by $\tan(\text{pitch})$, because a high bird is drawn well above its ground point.
+
+### Sound
+
+[birdAudio.ts](src/audio/birdAudio.ts) plays the events the simulation emits, through the weather audio's context and master gain (so the sound button mutes it too):
+
+| Sound | Graph |
+|---|---|
+| caw | sawtooth at 330–470 Hz, falling about 20% over the call, frequency-modulated by a 55–85 Hz square wave for a throaty rasp → two formant band-passes (1.3 kHz and 2.7 kHz), plus band-passed noise at 2.2 kHz. 0.22–0.35 s per call, in series of 1–3 from one bird (the same voice throughout) |
+| wingbeats | white noise → band-pass ~900 Hz, amplitude-pulsed at 14–18 Hz. One bird is a clean flutter; many taking off at once smear into a rush, louder and longer |
+
+How often the birds call depends on what the flock is doing: rarely at night, a chorus before dawn, a few calls while feeding, and a racket while wheeling at dusk or after a lightning strike. Each sound is attenuated by its distance from the camera, $1 / (1 + (d/140)^2)$, and panned by its screen-x offset. Sounds below 4% are skipped, and at most 6 caw series play at once.
 
 ---
 
@@ -460,6 +540,7 @@ Thunder starts `0.15 + distance / 220` s after the flash (capped at 3 s), so dis
 - **Height precision.** Heights are stored in 8 bits of voxels, so the maximum is 255 voxels (127.5 world units). Culling and the shadow march also assume nothing is taller than about 80 (`MAX_HEIGHT`, and the `q.z > 90` early-out).
 - **Light budget.** 48 point lights per frame, each with a ray-marched shadow, evaluated for every pixel. A tiled or clustered light list would be the next step.
 - **Weather is screen-local.** Particles exist only in a box around the camera, and lightning strikes near it. Swaying vegetation doesn't sway its shadow (the heightmap is static), and snow and puddles are a per-pixel look, not geometry.
+- **Birds don't see obstacles.** Flocks fly above everything instead of around it, and a bird that lands in cover simply disappears into the crown. Shadow rays see a flying bird and the scenery below it as two separate intervals, but a perched bird is part of its tree's column.
 - **Depth range.** Clip-space depth is `depth / 8192`, which caps the camera-relative depth range at about ±8192 world units. That is plenty for a 1024-unit world, but would need revisiting for larger ones.
 
 ## License

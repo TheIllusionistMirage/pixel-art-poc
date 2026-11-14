@@ -75,6 +75,9 @@ export interface Strike {
   /** Distance from the camera, world units (drives flash strength and thunder delay). */
   distance: number;
   strength: number;
+  /** Where it hit, world units (birds nearby scatter). */
+  x: number;
+  y: number;
 }
 
 /** Everything the renderer needs from the weather for one frame. */
@@ -213,7 +216,7 @@ export class Weather {
     this.pulses = [[0, 1], [0.08 + r() * 0.06, 0.45 + r() * 0.3]];
     if (r() < 0.6) this.pulses.push([0.22 + r() * 0.12, 0.5 + r() * 0.4]);
     this.bolt = d < 240 ? makeBolt(x, y, r) : null;
-    this.strikes.push({ distance: d, strength });
+    this.strikes.push({ distance: d, strength, x, y });
   }
 
   private flash(): number {

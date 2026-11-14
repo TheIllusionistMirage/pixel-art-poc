@@ -49,6 +49,39 @@ export interface Door {
   t: number;
 }
 
+/** One tree of a rookery. Positions in world units. */
+export interface RoostTree {
+  x: number;
+  y: number;
+  /** The tree model's wind bend (ModelInfo.sway), so perched birds can sway with it. */
+  sway: number;
+  /** Where birds sit at night: on the crown and the nest rims (world x, y, z). */
+  perches: [number, number, number][];
+}
+
+export interface Rookery {
+  x: number;
+  y: number;
+  trees: RoostTree[];
+}
+
+/** Open ground where flocks feed: a rotated rectangle (centre, axis cos/sin, half extents). */
+export interface ForagePatch {
+  x: number;
+  y: number;
+  ca: number;
+  sa: number;
+  hw: number;
+  hh: number;
+}
+
+export interface BirdSites {
+  rookeries: Rookery[];
+  forage: ForagePatch[];
+  /** Trees birds can dive into for cover: position and a height inside the crown. */
+  cover: { x: number; y: number; z: number }[];
+}
+
 export interface World {
   size: number;
   /** RGBA8 ground albedo, DETAIL texels per world unit ((size·DETAIL)² texels); alpha = material. */
@@ -59,6 +92,7 @@ export interface World {
   doors: Door[];
   /** Chimney mouths (world x, y, z) for smoke. */
   chimneys: [number, number, number][];
+  birds: BirdSites;
   counts: Record<string, number>;
 }
 
@@ -441,6 +475,73 @@ export function generateVillage(lib: Library, seed = 7): World {
     place(pick(rng, lib.grasses), x, y, rng() * Math.PI * 2, false, 'tallgrass');
   }
 
+  // ── Rookeries, forage grounds and cover for the birds ─────────────────
+  // A separate rng, so adding the birds leaves the rest of the layout unchanged.
+  const brng = mulberry32(seed * 31 + 5);
+  const isTree = (p: Placed) => /^(oak|pine|bush)\d/.test(p.model.name);
+  const openAround = (x: number, y: number, r: number) => {
+    for (let a = 0; a < 8; a++)
+      for (const rr of [0, r * 0.5, r]) {
+        const px = x + Math.cos(a * 0.785) * rr, py = y + Math.sin(a * 0.785) * rr;
+        if (!inWorld(px, py, 30)) return false;
+        const i = at(px, py);
+        if (roadMask[i] > 0.02 || blocked[i] || plazaMask[i]) return false;
+      }
+    return true;
+  };
+  const rookeries: Rookery[] = [];
+  const nSites = irange(brng, 3, 5), siteA0 = brng() * Math.PI * 2;
+  for (let k = 0; k < nSites; k++)
+    for (let attempt = 0; attempt < 240; attempt++) {
+      // Try the site's own sector first; if it has no open ground, anywhere on the ring away from the others.
+      const a = attempt < 80 ? siteA0 + (k / nSites) * Math.PI * 2 + range(brng, -0.5, 0.5) : brng() * Math.PI * 2;
+      const d = range(brng, 235, 320);
+      const x = CX + Math.cos(a) * d, y = CY + Math.sin(a) * d;
+      if (rookeries.some((r) => Math.hypot(r.x - x, r.y - y) < 140) || !openAround(x, y, 34)) continue;
+      const spots: [number, number][] = [[x, y]];
+      const nTrees = irange(brng, 2, 3), ta = brng() * Math.PI * 2;
+      for (let t = 1; t < nTrees; t++) {
+        const b = ta + t * range(brng, 1.8, 2.4), td = range(brng, 21, 26);
+        spots.push([x + Math.cos(b) * td, y + Math.sin(b) * td]);
+      }
+      // Clear the forest from under the crowns so the rookery stands out.
+      for (let i = statics.length - 1; i >= 0; i--) {
+        const p = statics[i];
+        if (isTree(p) && spots.some(([sx, sy]) => Math.hypot(p.x - sx, p.y - sy) < 15)) {
+          statics.splice(i, 1);
+          counts[p.model.name.replace(/\d+$/, '')]--;
+        }
+      }
+      const trees: RoostTree[] = spots.map(([sx, sy]) => {
+        const name = pick(brng, lib.rookeries), ang = brng() * Math.PI * 2;
+        place(name, sx, sy, ang, false, 'rookery');
+        const m = model(name);
+        const perches = Object.entries(m.anchors)
+          .filter(([key]) => key.startsWith('perch'))
+          .map(([, [ax, ay, az]]): [number, number, number] => {
+            const [ox, oy] = rot(ax, ay, ang);
+            return [sx + ox, sy + oy, az];
+          });
+        return { x: sx, y: sy, sway: m.sway, perches };
+      });
+      rookeries.push({ x, y, trees });
+      break;
+    }
+
+  const forage: ForagePatch[] = fields.map((f) => ({ x: f.cx, y: f.cy, ca: f.ca, sa: f.sa, hw: f.fw / 2 - 4, hh: f.fh / 2 - 4 }));
+  const treeSpots = statics.filter(isTree);
+  for (let attempt = 0, made = 0; attempt < 400 && made < 8; attempt++) {
+    const a = brng() * Math.PI * 2, d = range(brng, 110, 360);
+    const x = CX + Math.cos(a) * d, y = CY + Math.sin(a) * d;
+    if (forestDensity(x, y) > 0.2 || !openAround(x, y, 14)) continue;
+    if (treeSpots.some((t) => Math.abs(t.x - x) < 22 && Math.abs(t.y - y) < 22 && Math.hypot(t.x - x, t.y - y) < 22)) continue;
+    forage.push({ x, y, ca: 1, sa: 0, hw: 10, hh: 10 });
+    made++;
+  }
+  const cover = statics
+    .filter((p) => /^(oak|pine|rookery)\d/.test(p.model.name))
+    .map((p) => ({ x: p.x, y: p.y, z: p.model.h * 0.62 }));
+
   // ── Ground texture ────────────────────────────────────────────────────
   // Painted like pixel art at DETAIL texels per world unit: a few flat tones per
   // surface, transitions done with an ordered (Bayer) dither instead of
@@ -581,5 +682,5 @@ export function generateVillage(lib: Library, seed = 7): World {
   }
   for (let i = 0; i < GS * GS; i++) ground[i * 4 + 3] = mat[i];
 
-  return { size: S, ground, statics, lights, roads: { nodes, adj, ringCount: RING_N }, doors, chimneys, counts };
+  return { size: S, ground, statics, lights, roads: { nodes, adj, ringCount: RING_N }, doors, chimneys, birds: { rookeries, forage, cover }, counts };
 }

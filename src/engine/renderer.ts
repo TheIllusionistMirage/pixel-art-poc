@@ -73,7 +73,8 @@ export interface FrameInput {
   time: number;
   debug: number;
   shadows: boolean;
-  dynamic: { data: Float32Array; count: number };
+  /** Moving things; the last `flyers` instances are airborne (see HEIGHT_FS). */
+  dynamic: { data: Float32Array; count: number; flyers?: number };
   weather: WeatherFrame;
 }
 
@@ -84,13 +85,16 @@ export interface FrameStats {
   heightmapRebuilt: boolean;
 }
 
-/** Append one instance per slice of `m` placed at (x, y, angle). Returns the new float offset. */
-export function writeInstances(out: Float32Array, o: number, m: ModelInfo, x: number, y: number, angle: number): number {
+/**
+ * Append one instance per slice of `m` placed at (x, y, angle), raised by `zOff`
+ * voxels (a whole number keeps every slice on its own pixel row). Returns the new float offset.
+ */
+export function writeInstances(out: Float32Array, o: number, m: ModelInfo, x: number, y: number, angle: number, zOff = 0): number {
   for (const s of m.slices) {
     out[o++] = x;
     out[o++] = y;
     out[o++] = angle;
-    out[o++] = s.z;
+    out[o++] = s.z + zOff;
     out[o++] = s.u;
     out[o++] = s.v;
     out[o++] = m.tw;
@@ -268,13 +272,14 @@ export class Renderer {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
 
-    const hm = () => {
+    const hm = (rgba: boolean) => {
       // r: top of the column, g: 1 - bottom (see HEIGHT_FS). Both combine with MAX blending.
-      const tex = texture(gl, HM_SIZE, HM_SIZE, gl.RG8, gl.RG, gl.UNSIGNED_BYTE);
+      // The final map adds b / a, the same for airborne things; statics never fly.
+      const tex = rgba ? texture(gl, HM_SIZE, HM_SIZE, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE) : texture(gl, HM_SIZE, HM_SIZE, gl.RG8, gl.RG, gl.UNSIGNED_BYTE);
       return { tex, fb: framebuffer(gl, [tex]) };
     };
-    this.hmStatic = hm();
-    this.hmFinal = hm();
+    this.hmStatic = hm(false);
+    this.hmFinal = hm(true);
     gl.bindVertexArray(null);
   }
 
@@ -375,13 +380,14 @@ export class Renderer {
       }
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, f.dynamic.data, 0, f.dynamic.count * FLOATS_PER_INSTANCE);
     }
-    const drawDynamic = () => {
-      if (!f.dynamic.count) return;
-      this.bindInstances(this.dynBuf, 0);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, f.dynamic.count);
+    const drawDynamic = (first = 0, n = f.dynamic.count) => {
+      if (n <= 0) return;
+      this.bindInstances(this.dynBuf, first);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
       stats.drawCalls++;
-      stats.instances += f.dynamic.count;
+      stats.instances += n;
     };
+    const flyers = Math.min(f.dynamic.flyers ?? 0, f.dynamic.count);
 
     // ── 1. Heightmap ────────────────────────────────────────────────────
     gl.disable(gl.DEPTH_TEST);
@@ -393,6 +399,7 @@ export class Renderer {
     gl.uniform2f(this.heightProg.u.u_hmOrigin, hmb.minX, hmb.minY);
     gl.uniform1f(this.heightProg.u.u_hmSize, HM_WORLD);
     gl.uniform1f(this.heightProg.u.u_detail, DETAIL);
+    gl.uniform1i(this.heightProg.u.u_layer, 0);
     this.bindTex(0, this.albedoTex, this.heightProg.u.u_albedo);
     if (!this.hmOrigin || this.hmOrigin[0] !== hmb.minX || this.hmOrigin[1] !== hmb.minY) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.hmStatic.fb);
@@ -409,7 +416,14 @@ export class Renderer {
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.hmFinal.fb);
     gl.blitFramebuffer(0, 0, HM_SIZE, HM_SIZE, 0, 0, HM_SIZE, HM_SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.hmFinal.fb);
-    drawDynamic();
+    // The blit fills b / a from an RG source with (0, 1); empty them for the flyers.
+    gl.colorMask(false, false, true, true);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.colorMask(true, true, true, true);
+    drawDynamic(0, f.dynamic.count - flyers);
+    gl.uniform1i(this.heightProg.u.u_layer, 1);
+    drawDynamic(f.dynamic.count - flyers, flyers);
     gl.blendEquation(gl.FUNC_ADD);
     gl.disable(gl.BLEND);
 

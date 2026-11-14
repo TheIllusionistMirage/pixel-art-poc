@@ -17,6 +17,10 @@ export interface Library {
   grasses: string[];
   /** villagers[look][frame] */
   villagers: string[][];
+  /** Oaks with nests and `perch*` anchors, for the rookeries. */
+  rookeries: string[];
+  /** Rook frames: 0 wings up, 1 level, 2 wings down (flight), 3 standing, 4 pecking. */
+  rooks: string[];
 }
 
 export function buildLibrary(seed = 1): Library {
@@ -49,7 +53,12 @@ export function buildLibrary(seed = 1): Library {
   add('campfire', M.campfire(seed));
   add('fisher', actor(M.fisher(seed)));
   add('lantern', M.lantern(seed));
+  const rookeries = many('rookery', 3, M.rookery, 1.6);
+  const rooks = [
+    ...([0, 1, 2] as const).map((f) => add(`rook_fly${f}`, actor(M.rookFlying(f, seed)))),
+    ...([0, 1] as const).map((p) => add(`rook_stand${p}`, actor(M.rookStanding(p, seed)))),
+  ];
   const villagers = M.VILLAGER_LOOKS.map((look, li) => ([0, 1, 2] as const).map((f) => add(`villager${li}_${f}`, actor(M.villager(look, f)))));
 
-  return { atlas: buildAtlas(entries), houses, oaks, pines, bushes, rocks, stalls, reeds, grasses, villagers };
+  return { atlas: buildAtlas(entries), houses, oaks, pines, bushes, rocks, stalls, reeds, grasses, villagers, rookeries, rooks };
 }
