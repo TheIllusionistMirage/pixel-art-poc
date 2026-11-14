@@ -6,7 +6,7 @@ TypeScript + raw WebGL2. No engine, no runtime dependencies.
 
 ### Demo
 
-![Demo screenshot](demo.png)
+https://theillusionistmirage.github.io/pixel-art-poc/
 
 ```sh
 npm install
