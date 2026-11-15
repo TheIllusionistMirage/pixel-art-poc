@@ -11,6 +11,7 @@ https://theillusionistmirage.github.io/pixel-art-poc/
 ```sh
 npm install
 npm run dev        # Vite dev server
+npm run dev:lan    # same, but reachable from other devices on your network (e.g. a phone)
 npm run typecheck
 ```
 
@@ -33,6 +34,19 @@ npm run typecheck
 | **weather** dropdown (top right) | Clear, Cloudy, Overcast, Fog, Light rain, Rain, Thunderstorm, Light snow, Snow, Blizzard. Changes crossfade over a few seconds |
 | **crowd** button | cycle villager density: none → sparse (35%) → normal → busy (2.5×) → crowded (5×), relative to the `villagers` count. Changes apply instantly |
 | **sound** button | mute / unmute the procedural weather and bird audio (audio starts after the first click or key press) |
+
+#### Touch (phones and tablets)
+
+| Gesture / button | Action |
+|---|---|
+| one-finger drag | pan |
+| pinch | zoom (one step per ~30% change in finger spread) |
+| two-finger twist | rotate |
+| two-finger drag up / down | tilt |
+| **−1h** / **+1h**, **pause**, **reset** buttons | hour back / forward, pause the clock, reset camera |
+| tap the HUD | show / hide the stats and help |
+
+On iOS, sound starts on the first tap and plays even with the ring/silent switch set to silent (the page asks for the media audio session, the way a video player does).
 
 ### URL parameters
 

@@ -2,42 +2,82 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- maximum-scale stops iOS auto-zooming when the weather <select> gets focus; viewport-fit=cover lets us use the notch area. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#000000" />
     <title>Medieval Village PoC</title>
     <style>
-      html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
-      canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
-      canvas:active { cursor: grabbing; }
-      #hud {
-        position: fixed; top: 10px; left: 10px; padding: 8px 10px;
-        font: 12px/1.45 ui-monospace, Menlo, monospace; color: #f2ead8;
-        background: rgba(20, 16, 12, 0.72); border: 1px solid rgba(242, 234, 216, 0.15);
-        border-radius: 4px; white-space: pre; pointer-events: none; user-select: none;
+      html, body {
+        margin: 0; height: 100%; overflow: hidden; background: #000;
+        overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+        -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
       }
-      #controls {
-        position: fixed; top: 10px; right: 10px; padding: 8px 10px; display: flex; gap: 8px; align-items: center;
+      canvas {
+        display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh;
+        cursor: grab; touch-action: none;
+      }
+      canvas:active { cursor: grabbing; }
+      .panel {
+        position: fixed; padding: 8px 10px;
         font: 12px/1.45 ui-monospace, Menlo, monospace; color: #f2ead8;
         background: rgba(20, 16, 12, 0.72); border: 1px solid rgba(242, 234, 216, 0.15); border-radius: 4px;
+      }
+      #hud {
+        top: max(10px, env(safe-area-inset-top)); left: max(10px, env(safe-area-inset-left));
+        white-space: pre; pointer-events: none;
+      }
+      #controls {
+        top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+        display: flex; flex-wrap: wrap; gap: 8px; align-items: center; touch-action: manipulation;
       }
       #controls select, #controls button {
         font: inherit; color: inherit; background: rgba(242, 234, 216, 0.08);
         border: 1px solid rgba(242, 234, 216, 0.25); border-radius: 3px; padding: 2px 6px; cursor: pointer;
       }
       #controls select option { color: #f2ead8; background: #2a231b; }
+      .touch-only { display: none; }
+
+      /* Touch devices: bigger hit targets, keyboard-free buttons, tappable HUD. */
+      @media (pointer: coarse) {
+        .touch-only { display: contents; }
+        #hud { pointer-events: auto; cursor: pointer; }
+        #controls select, #controls button { min-height: 34px; padding: 4px 10px; }
+        /* iOS zooms into form fields whose text is smaller than 16px. */
+        #controls select { font-size: 16px; }
+      }
+      /* Narrow screens (phones in portrait): HUD on top, controls docked at the bottom. */
+      @media (max-width: 700px) {
+        .panel { font-size: 10px; }
+        #hud { right: max(10px, env(safe-area-inset-right)); overflow: hidden; text-overflow: ellipsis; }
+        #controls {
+          top: auto; bottom: max(10px, env(safe-area-inset-bottom));
+          left: max(10px, env(safe-area-inset-left)); right: max(10px, env(safe-area-inset-right));
+          justify-content: center; font-size: 12px;
+        }
+      }
       #loading {
-        position: fixed; inset: 0; display: grid; place-items: center;
+        position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center;
         font: 14px ui-monospace, Menlo, monospace; color: #f2ead8;
       }
     </style>
   </head>
   <body>
     <canvas id="view"></canvas>
-    <div id="hud"></div>
-    <div id="controls">
+    <div id="hud" class="panel"></div>
+    <div id="controls" class="panel">
       <label for="weather">weather</label>
       <select id="weather"></select>
       <button id="crowd" type="button">crowd: normal</button>
       <button id="sound" type="button">sound: on</button>
+      <span class="touch-only">
+        <button id="hour-back" type="button" aria-label="hour back">−1h</button>
+        <button id="pause" type="button">pause</button>
+        <button id="hour-fwd" type="button" aria-label="hour forward">+1h</button>
+        <button id="reset" type="button">reset</button>
+      </span>
     </div>
     <div id="loading">generating village…</div>
     <script type="module" src="/src/main.ts"></script>

@@ -32,6 +32,43 @@ function noiseBuffer(ctx: AudioContext, seconds: number, brown: boolean): AudioB
   return buf;
 }
 
+// iOS (every browser there is WebKit) plays Web Audio in the "ambient" audio session, which the
+// ring/silent switch mutes — so on a phone set to silent there is no sound at all. Two ways out:
+// the Audio Session API (iOS 17+, but not in every browser or on plain-http pages), and the
+// long-standing trick of looping a silent <audio> element, which moves the page to the "playback"
+// session that ignores the switch. Do both; each needs a user gesture to take effect.
+const IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let silentLoop: HTMLAudioElement | null = null;
+
+/** A short, silent 8 kHz 8-bit mono WAV. */
+function silentWav(): string {
+  const n = 4000, b = new DataView(new ArrayBuffer(44 + n));
+  const str = (o: number, s: string) => [...s].forEach((c, i) => b.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); b.setUint32(4, 36 + n, true); str(8, 'WAVEfmt ');
+  b.setUint32(16, 16, true); b.setUint16(20, 1, true); b.setUint16(22, 1, true);
+  b.setUint32(24, 8000, true); b.setUint32(28, 8000, true); b.setUint16(32, 1, true); b.setUint16(34, 8, true);
+  str(36, 'data'); b.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) b.setUint8(44 + i, 128); // 8-bit PCM silence is the midpoint
+  return URL.createObjectURL(new Blob([b.buffer], { type: 'audio/wav' }));
+}
+
+function playAsMedia(): void {
+  const nav = navigator as Navigator & { audioSession?: { type: string } };
+  try {
+    if (nav.audioSession && nav.audioSession.type !== 'playback') nav.audioSession.type = 'playback';
+  } catch { /* not allowed here; the <audio> fallback covers it */ }
+  if (!silentLoop) {
+    silentLoop = document.createElement('audio');
+    silentLoop.src = silentWav();
+    silentLoop.loop = true;
+    silentLoop.setAttribute('playsinline', '');
+    silentLoop.setAttribute('x-webkit-airplay', 'deny');
+    // Don't hold the media session while the page is in the background.
+    document.addEventListener('visibilitychange', () => document.hidden && silentLoop!.pause());
+  }
+  if (silentLoop.paused) silentLoop.play().catch(() => {});
+}
+
 export class WeatherAudio {
   private ctx: AudioContext | null = null;
   private master!: GainNode;
@@ -64,8 +101,10 @@ export class WeatherAudio {
 
   /** Call from a user gesture. Safe to call repeatedly. */
   unlock(): void {
+    if (IOS) playAsMedia();
     if (this.ctx) {
-      if (this.ctx.state === 'suspended') void this.ctx.resume();
+      // iOS also uses a non-standard 'interrupted' state (calls, app switches), not just 'suspended'.
+      if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {});
       return;
     }
     const ctx = new AudioContext();

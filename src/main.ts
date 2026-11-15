@@ -74,16 +74,28 @@ const state = {
   crowd: Math.max(0, Math.min(CROWD.length - 1, Math.round(num('crowd', 2)) || 0)),
 };
 
+/** Auto zoom tracks the window size until the user picks a zoom level themselves. */
+let autoZoom = !state.zoom;
+const setZoom = (z: number) => {
+  autoZoom = false;
+  state.zoom = Math.max(1, Math.min(8, z));
+  resize();
+};
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   canvas.width = Math.floor(canvas.clientWidth * dpr);
   canvas.height = Math.floor(canvas.clientHeight * dpr);
-  // Auto zoom frames ~420 world units across, i.e. ~420·DETAIL art pixels.
-  if (!state.zoom) state.zoom = Math.max(1, Math.round(canvas.width / (420 * DETAIL)));
+  // Auto zoom frames ~420 world units along the longer side, i.e. ~420·DETAIL art pixels
+  // (the longer side, so a portrait phone gets the same pixel size as a landscape one).
+  if (autoZoom) state.zoom = Math.max(1, Math.round(Math.max(canvas.width, canvas.height) / (420 * DETAIL)));
   renderer.setSize(canvas.width, canvas.height, state.zoom);
 }
+// ResizeObserver also catches mobile browser bars sliding in and out, which don't always fire `resize`.
+new ResizeObserver(resize).observe(canvas);
 window.addEventListener('resize', resize);
 resize();
+
+const isTouch = matchMedia('(pointer: coarse)').matches;
 
 // ── Weather + sound ─────────────────────────────────────────────────────
 const weather = new Weather();
@@ -117,9 +129,41 @@ crowdButton.addEventListener('click', () => {
   crowdButton.blur();
 });
 setCrowd(state.crowd);
-// Audio may only start after a user gesture.
-window.addEventListener('pointerdown', () => audio.unlock(), { once: true });
-window.addEventListener('keydown', () => audio.unlock(), { once: true });
+// Audio may only start after a user gesture. iOS only accepts some gesture events (touchend/click,
+// not touchstart) and suspends the context again when the page is backgrounded, so keep listening;
+// unlock() is cheap once the context is running.
+for (const ev of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) window.addEventListener(ev, () => audio.unlock(), { passive: true });
+
+// Touch-only buttons for actions that otherwise need a keyboard.
+const pauseButton = document.getElementById('pause') as HTMLButtonElement;
+const showPause = () => (pauseButton.textContent = state.paused ? 'play' : 'pause');
+const togglePause = () => {
+  state.paused = !state.paused;
+  showPause();
+};
+showPause();
+const resetView = () => Object.assign(view, { x: world.size / 2, y: world.size / 2 + 20, angle: 0, pitch: DEFAULT_PITCH * DEG });
+const touchButtons: Record<string, () => void> = {
+  'hour-back': () => (state.hour = (state.hour + 23) % 24),
+  pause: togglePause,
+  'hour-fwd': () => (state.hour = (state.hour + 1) % 24),
+  reset: resetView,
+};
+for (const [id, action] of Object.entries(touchButtons)) {
+  const b = document.getElementById(id) as HTMLButtonElement;
+  b.addEventListener('click', () => {
+    action();
+    b.blur();
+  });
+}
+// The HUD is long; on touch screens it starts collapsed and a tap toggles the details.
+let hudExpanded = !isTouch;
+hud.addEventListener('click', () => {
+  hudExpanded = !hudExpanded;
+  hudTimer = 0;
+});
+// Stop iOS page pinch-zoom (it ignores user-scalable=no) so pinches reach the canvas.
+document.addEventListener('gesturestart', (e) => e.preventDefault());
 
 // ── Input ───────────────────────────────────────────────────────────────
 const keys = new Set<string>();
@@ -127,7 +171,7 @@ window.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLButtonElement) return;
   keys.add(e.code);
   switch (e.code) {
-    case 'Space': state.paused = !state.paused; break;
+    case 'Space': togglePause(); break;
     case 'BracketRight': state.daySpeed *= 2; break;
     case 'BracketLeft': state.daySpeed /= 2; break;
     case 'Period': state.hour = (state.hour + 1) % 24; break;
@@ -135,9 +179,9 @@ window.addEventListener('keydown', (e) => {
     case 'KeyG': state.debug = (state.debug + 1) % DEBUG_VIEWS.length; break;
     case 'KeyH': state.shadows = !state.shadows; break;
     case 'KeyC': setCrowd(state.crowd + (e.shiftKey ? -1 : 1)); break;
-    case 'Equal': state.zoom = Math.min(8, state.zoom + 1); resize(); break;
-    case 'Minus': state.zoom = Math.max(1, state.zoom - 1); resize(); break;
-    case 'KeyR': Object.assign(view, { x: world.size / 2, y: world.size / 2 + 20, angle: 0, pitch: DEFAULT_PITCH * DEG }); break;
+    case 'Equal': setZoom(state.zoom + 1); break;
+    case 'Minus': setZoom(state.zoom - 1); break;
+    case 'KeyR': resetView(); break;
   }
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
@@ -153,29 +197,75 @@ function panScreen(dx: number, dy: number) {
   view.y = Math.max(0, Math.min(world.size, view.y));
 }
 
-let drag: { button: number; x: number; y: number } | null = null;
+/** Rotate (horizontal) and tilt (vertical) by a CSS-pixel drag delta. */
+function orbit(dx: number, dy: number) {
+  view.angle += dx * 0.006;
+  view.pitch = clampPitch(view.pitch - dy * 0.004); // drag up = camera higher
+}
+/** Pan so the ground follows a CSS-pixel drag delta. */
+function dragPan(dx: number, dy: number) {
+  const k = (window.devicePixelRatio || 1) / state.zoom / DETAIL;
+  panScreen(-dx * k, -dy * k);
+}
+
+// Pointers currently down on the canvas. Mouse: left-drag pans, right/shift-drag orbits.
+// Touch: one finger pans; two fingers pinch to zoom, twist to rotate and drag up/down to tilt.
+const pointers = new Map<number, { x: number; y: number; orbit: boolean }>();
+/** Two-finger gesture: the finger span at the last zoom step, and last frame's twist angle and midpoint. */
+let pinch: { span0: number; angle: number; midY: number } | null = null;
+function twoFingers() {
+  const [a, b] = [...pointers.values()];
+  return { span: Math.hypot(b.x - a.x, b.y - a.y), angle: Math.atan2(b.y - a.y, b.x - a.x), midY: (a.y + b.y) / 2 };
+}
+function startPinch() {
+  if (pointers.size !== 2) return void (pinch = null);
+  const g = twoFingers();
+  pinch = { span0: g.span, angle: g.angle, midY: g.midY };
+}
+
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => {
-  drag = { button: e.shiftKey ? 2 : e.button, x: e.clientX, y: e.clientY };
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, orbit: e.pointerType === 'mouse' && (e.shiftKey || e.button === 2) });
   canvas.setPointerCapture(e.pointerId);
+  startPinch();
 });
-canvas.addEventListener('pointerup', () => (drag = null));
+const pointerEnd = (e: PointerEvent) => {
+  pointers.delete(e.pointerId);
+  startPinch(); // two fingers left (e.g. a third one lifted): restart cleanly; otherwise stop
+};
+canvas.addEventListener('pointerup', pointerEnd);
+canvas.addEventListener('pointercancel', pointerEnd);
 canvas.addEventListener('pointermove', (e) => {
-  if (!drag) return;
-  const dpr = window.devicePixelRatio || 1;
-  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-  drag.x = e.clientX;
-  drag.y = e.clientY;
-  if (drag.button === 2) {
-    view.angle += dx * 0.006;
-    view.pitch = clampPitch(view.pitch - dy * 0.004); // drag up = camera higher
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX;
+  p.y = e.clientY;
+  if (pointers.size === 1) {
+    if (p.orbit) orbit(dx, dy);
+    else dragPan(dx, dy);
+    return;
   }
-  else panScreen((-dx * dpr) / state.zoom / DETAIL, (-dy * dpr) / state.zoom / DETAIL);
+  if (!pinch) return;
+  const g = twoFingers();
+  // Twist: turn the world with the fingers. Screen angles grow clockwise; view.angle turns the world anticlockwise.
+  let da = g.angle - pinch.angle;
+  da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI;
+  view.angle -= da;
+  pinch.angle = g.angle;
+  // Both fingers moving up or down together: tilt.
+  view.pitch = clampPitch(view.pitch - (g.midY - pinch.midY) * 0.004);
+  pinch.midY = g.midY;
+  // Pinch: zoom is in whole steps, so step each time the span changes by ~30%.
+  const ratio = g.span / pinch.span0;
+  if (ratio > 1.3 || ratio < 1 / 1.3) {
+    setZoom(state.zoom + (ratio > 1 ? 1 : -1));
+    pinch.span0 = g.span;
+  }
 });
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  state.zoom = Math.max(1, Math.min(8, state.zoom + (e.deltaY < 0 ? 1 : -1)));
-  resize();
+  setZoom(state.zoom + (e.deltaY < 0 ? 1 : -1));
 }, { passive: false });
 
 // ── Loop ────────────────────────────────────────────────────────────────
@@ -272,18 +362,28 @@ function frame(now: number) {
     hudTimer = 0.2;
     const hh = Math.floor(state.hour), mm = Math.floor((state.hour % 1) * 60);
     const [rw, rh] = renderer.internalResolution;
-    hud.textContent = [
+    const summary = [
       `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}  ${lighting.phase}${state.paused ? '  (paused)' : `  ×${(state.daySpeed * 8).toFixed(2)}`}`,
       `${fps.toFixed(0)} fps   cpu ${cpuMs.toFixed(1)} ms   ${rw}×${rh} @${state.zoom}x`,
+    ];
+    if (!hudExpanded) {
+      hud.textContent = [...summary, `tap for details`].join('\n');
+    }
+    else hud.textContent = [
+      ...summary,
       `objects ${world.statics.length}   villagers ${villagers.active} (${CROWD[state.crowd].label})   lights ${stats.lights}`,
       `birds ${birds.count} in ${birds.flockCount} flocks (${birds.flying} flying${birds.hiddenCount ? `, ${birds.hiddenCount} sheltering` : ''})`,
       `slices drawn ${stats.instances.toLocaleString()} / ${(renderer.staticInstanceCount + instances).toLocaleString()}   draws ${stats.drawCalls}`,
       `weather ${weather.preset.label}${weather.transitioning ? ' (changing)' : ''}   wind ${Math.hypot(...weather.wind).toFixed(2)}   wet ${(weather.wetness * 100).toFixed(0)}%   snow ${(weather.snowCover * 100).toFixed(0)}%   indoors ${villagers.indoors()}`,
       `view: ${DEBUG_VIEWS[state.debug]}${state.shadows ? '' : '  (shadows off)'}   pitch ${(view.pitch / DEG).toFixed(0)}°`,
       ``,
-      `drag pan · shift/right-drag rotate & tilt · wheel zoom`,
-      `WASD pan · Q/E rotate · Z/X tilt · , . hour · [ ] speed`,
-      `space pause · G debug view · H shadows · C crowd · R reset`,
+      ...(isTouch
+        ? [`drag pan · pinch zoom`, `two-finger twist rotate · two-finger drag tilt`, `tap here to collapse`]
+        : [
+          `drag pan · shift/right-drag rotate & tilt · wheel zoom`,
+          `WASD pan · Q/E rotate · Z/X tilt · , . hour · [ ] speed`,
+          `space pause · G debug view · H shadows · C crowd · R reset`,
+        ]),
     ].join('\n');
   }
   requestAnimationFrame(frame);
